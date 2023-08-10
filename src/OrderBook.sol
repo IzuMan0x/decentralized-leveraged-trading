@@ -26,6 +26,8 @@ pragma solidity ^0.8.19;
 import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {IPyth} from "@pyth-sdk-solidity/IPyth.sol";
+import {PythStructs} from "@pyth-sdk-solidity/PythStructs.sol";
 
 contract OrderBook is ReentrancyGuard, Ownable {
     ////////////////////
@@ -34,12 +36,43 @@ contract OrderBook is ReentrancyGuard, Ownable {
     error OrderBook__NeedsMoreThanZero();
     error OrderBook__UserClosingNonExistingPosition();
     error OrderBook__InvalidTradingPair();
-    error OrderBook__MaxNumberOfOpenTrades5Reached();
+    error OrderBook__MaxNumberOfOpenTrades3Reached();
     error OrderBook__TransferFailed();
+    error OrderBook__MaxLeverageIs150();
+    error OrderBook__InvalidOrderType();
 
     ////////////////////
     // State Variables //
     ////////////////////
+    IPyth pyth;
+
+    //note enums start at zero so LONG=0 and SHORT=1
+
+    enum PositionDirection {
+        LONG,
+        SHORT
+    }
+
+    //PositionDirection s_longShort;
+
+    struct PositionDetails {
+        uint256 pairNumber;
+        uint64 openPrice;
+        uint256 collateralAfterFee;
+        uint256 leverage;
+        uint256 longShort; //0 for long and 1 for short
+        uint256 openTime;
+        uint256 placeHolder; //maybe we will need this later...
+    }
+    //maybe put in fee here if we want each asset to have a ddifferent fee
+
+    struct AssetPairDetails {
+        bytes32 pythPriceFeedAddress;
+        uint256 assetTotalShorts;
+        uint256 assetTotalLongs;
+    }
+
+    //note the following will be replaced by the enum
     uint256 private constant LONG_POSITION = 1;
     uint256 private constant SHORT_POSITION = 2;
     uint256 private constant FEE_PRECISION = 1_000_000; //or 1e6
@@ -55,21 +88,33 @@ contract OrderBook is ReentrancyGuard, Ownable {
     uint256 private s_baseBorrowFeePercentage; // 0.001%/h or 1000
 
     //Lets say 1: eth/usd 2: wbtc/usd 3: XRP/USD
-    mapping(uint256 pairIndex => address priceFeedAddress) private s_tradingPairs;
-    mapping(address userTrades => mapping(uint256 tradeIndex => uint256[] positionDetails)) private s_userTrades;
-    mapping(address userAddress => uint256 openTrades) private s_userOpenTrades;
-    mapping(uint256 pairIndex => uint256[] totalPositionsSize) private s_longShortTotal; //uint256[] index 1 is for longs and index 2 is for shorts
+    //Maybe change the mappings a bit and create an order struct in another contract
+    mapping(uint256 assetPairIndex => AssetPairDetails assetPairDetails) private s_assetPairDetails;
+    mapping(
+        address userAddress
+            => mapping(
+                uint256 assetPairIndex => mapping(uint256 openTradesIncrementer => PositionDetails positionDetails)
+            )
+    ) private s_userTradeDetails;
+    //
+    mapping(address userAddress => mapping(uint256 pairIndex => uint256 numberOfOpenTrades)) private s_userOpenTrades;
+
+    //The following will be removed by the new assetPair struct
+    //Maybe change the following mapping to an enum or struct
+    //mapping(uint256 pairIndex => uint256[] totalPositionsSize) private s_longShortTotal; //uint256[] index 1 is for longs and index 2 is for shorts index 0 should be empty
+
+    //Lets slim down the mappings for asset pair and create a struct for an asset pair that has the price feed address, amount of short and the amount of long positions
 
     ////////////////////
     // Events         //
     ///////////////////
     event OrderClosed(address indexed user, uint256 indexed pairIndex, int256 indexed userPNL);
-    event MarketTrade(address indexed user, uint256 indexed pairIndex, uint256 indexed positionSize);
+    event MarketTrade(address indexed user, uint256 indexed pairIndex);
 
     ////////////////////
     // Modifiers      //
     ////////////////////
-    //position nad leverage needs to be more than zero
+    //position and leverage needs to be more than zero
     modifier moreThanZero(uint256 amount, uint256 leverage) {
         if (amount == 0 || leverage == 0) {
             revert OrderBook__NeedsMoreThanZero();
@@ -77,23 +122,37 @@ contract OrderBook is ReentrancyGuard, Ownable {
         _;
     }
 
-    modifier userPositionExist(address user, uint256 tradeIndex) {
-        if (s_userTrades[user][tradeIndex][1] == 0) {
+    modifier userPositionExist(address user, uint256 tradeIndex, uint256 userTradesIdForPair) {
+        if (s_userTradeDetails[user][tradeIndex][userTradesIdForPair].openPrice == 0) {
             revert OrderBook__UserClosingNonExistingPosition();
         }
         _;
     }
 
     modifier validPair(uint256 pairIndex) {
-        if (s_tradingPairs[pairIndex] == address(0)) {
+        if (s_assetPairDetails[pairIndex].pythPriceFeedAddress == 0) {
             revert OrderBook__InvalidTradingPair();
         }
         _;
     }
 
-    modifier maxTradeCount(address user) {
-        if (s_userOpenTrades[user] >= 5) {
-            revert OrderBook__MaxNumberOfOpenTrades5Reached();
+    modifier maxTradeCount(address user, uint256 pairIndex) {
+        if (s_userOpenTrades[user][pairIndex] >= 3) {
+            revert OrderBook__MaxNumberOfOpenTrades3Reached();
+        }
+        _;
+    }
+
+    modifier maxLeverage(uint256 leverage) {
+        if (leverage > 150) {
+            revert OrderBook__MaxLeverageIs150();
+        }
+        _;
+    }
+
+    modifier validOrderType(uint256 orderType) {
+        if (orderType != 0 || orderType != 1) {
+            revert OrderBook__InvalidOrderType();
         }
         _;
     }
@@ -101,139 +160,291 @@ contract OrderBook is ReentrancyGuard, Ownable {
     ////////////////////
     // Functions  🥸   //
     ////////////////////
+
+    ////////////////////
+    // Constructor    //
+    ////////////////////
     constructor(
+        address pythPriceFeedAddress,
         address tokenCollateralAddress,
         uint256 openFeePercentage,
         uint256 closingFeePercentage,
-        uint256 baseBorrowFeePercentage
+        uint256 baseBorrowFeePercentage,
+        bytes32 pairPriceFeedAddressId
     ) {
         s_tokenCollateralAddress = tokenCollateralAddress;
         s_openFeePercentage = openFeePercentage;
         s_closingFeePercentage = closingFeePercentage;
         s_baseBorrowFeePercentage = baseBorrowFeePercentage;
+        pyth = IPyth(pythPriceFeedAddress);
+        s_assetPairDetails[1].pythPriceFeedAddress = pairPriceFeedAddressId;
     }
 
-    function marketOrder(uint256 pairIndex, uint256 amountCollateral, uint256 leverage, uint8 orderType)
+    //we will refactor the marketorder function
+    //Be careful modifying this function it is very close to throwing error "stack too deep"🧐
+    function marketOrder(
+        uint256 pairIndex,
+        uint256 amountCollateral,
+        uint256 leverage,
+        uint256 orderType,
+        bytes[] calldata priceUpdateData
+    )
         public
+        payable
         moreThanZero(amountCollateral, leverage)
         validPair(pairIndex)
-        maxTradeCount(msg.sender)
+        maxTradeCount(msg.sender, pairIndex)
+        maxLeverage(leverage)
+        validOrderType(orderType)
         nonReentrant
     {
-        bool success = IERC20(s_tokenCollateralAddress).transferFrom(msg.sender, address(this), amountCollateral);
+        _sendFunds(msg.sender, amountCollateral);
+
+        _order(msg.sender, pairIndex, amountCollateral, leverage, orderType, priceUpdateData);
+
+        //after testing change this to the function inputs, it will probably be more efficient on gas
+        emit MarketTrade(msg.sender, pairIndex);
+        //taken out fo the event emit due to stack being too deep
+        // s_userTradeDetails[msg.sender][pairIndex][s_userOpenTrades[msg.sender][pairIndex]].collateralAfterFee* leverage
+    }
+
+    function orderClose(uint256 tradeIndex, uint256 userTradesIdForPair, bytes[] calldata priceUpdateData)
+        public
+        userPositionExist(msg.sender, tradeIndex, userTradesIdForPair)
+        nonReentrant
+    {
+        PositionDetails memory userPositionDetails = s_userTradeDetails[msg.sender][tradeIndex][userTradesIdForPair];
+
+        int256 userPNL = _getUserPNL(msg.sender, userPositionDetails, userTradesIdForPair, priceUpdateData);
+
+        //reset the trading book
+        delete s_userTradeDetails[msg.sender][userPositionDetails.pairNumber][userTradesIdForPair];
+
+        if (userPNL >= 0) {
+            uint256 uintUserPNL = uint256(userPNL);
+            _sendFunds(msg.sender, uintUserPNL);
+        }
+
+        emit OrderClosed(msg.sender, userPositionDetails.pairNumber, userPNL);
+    }
+
+    //////////////////////
+    // Private Functions//
+    //////////////////////
+    function _getUserPNL(
+        address user,
+        PositionDetails memory userPositionDetails,
+        uint256 userTradesIdForPair,
+        bytes[] calldata priceUpdateData
+    ) private returns (int256) {
+        //get price with the pairIndex
+        PythStructs.Price memory closePriceData =
+            getTradingPairCurrentPrice(priceUpdateData, userPositionDetails.pairNumber);
+        //We need to create a function that gets the average fee for the duration of the trade
+
+        int256 borrowFeePercentage = _calculateBorrowFee(user, userPositionDetails.pairNumber, userTradesIdForPair);
+
+        //This needs to be made an average based on the ratio of users long and short postions
+        int256 totalBorrowFeeAmount = int256(borrowFeePercentage) * int256(userPositionDetails.leverage)
+            * int256(userPositionDetails.collateralAfterFee) * int256(block.timestamp - userPositionDetails.openTime);
+
+        int256 userPNL;
+        int256 priceChange = int256(uint256(userPositionDetails.openPrice)) - int256(closePriceData.price);
+        if (userPositionDetails.longShort == 0) {
+            userPNL = int256(userPositionDetails.collateralAfterFee) - totalBorrowFeeAmount
+                - int256(userPositionDetails.leverage) * priceChange * int256(userPositionDetails.collateralAfterFee);
+        }
+        if (userPositionDetails.longShort == 1) {
+            userPNL = int256(userPositionDetails.collateralAfterFee) - totalBorrowFeeAmount
+                + int256(userPositionDetails.leverage) * priceChange * int256(userPositionDetails.collateralAfterFee);
+        }
+
+        userPNL =
+            userPNL - int256(_calculateOpenFee(userPositionDetails.collateralAfterFee, userPositionDetails.leverage));
+        return userPNL;
+    }
+
+    //adding this for getting updating the front end however there is a possibility the priceFeed is stale, thus we dont want to pay for an update if we just reading from the
+    //contract. Thus, we will just pull the userPositionDetails and calculate the PNL from the priceFeed API.
+    function _getUserPnlUnsafe(
+        address user,
+        PositionDetails memory userPositionDetails,
+        uint256 userTradesIdForPair,
+        bytes[] calldata priceUpdateData
+    ) private returns (int256) {
+        //get price with the pairIndex
+        PythStructs.Price memory closePriceData =
+            getTradingPairCurrentPrice(priceUpdateData, userPositionDetails.pairNumber);
+        //We need to create a function that gets the average fee for the duration of the trade
+
+        int256 borrowFeePercentage = _calculateBorrowFee(user, userPositionDetails.pairNumber, userTradesIdForPair);
+
+        //This needs to be made an average based on the ratio of users long and short postions
+        int256 totalBorrowFeeAmount = int256(borrowFeePercentage) * int256(userPositionDetails.leverage)
+            * int256(userPositionDetails.collateralAfterFee) * int256(block.timestamp - userPositionDetails.openTime);
+
+        int256 userPNL;
+        int256 priceChange = int256(uint256(userPositionDetails.openPrice)) - int256(closePriceData.price);
+        if (userPositionDetails.longShort == 0) {
+            userPNL = int256(userPositionDetails.collateralAfterFee) - totalBorrowFeeAmount
+                - int256(userPositionDetails.leverage) * priceChange * int256(userPositionDetails.collateralAfterFee);
+        }
+        if (userPositionDetails.longShort == 1) {
+            userPNL = int256(userPositionDetails.collateralAfterFee) - totalBorrowFeeAmount
+                + int256(userPositionDetails.leverage) * priceChange * int256(userPositionDetails.collateralAfterFee);
+        }
+
+        userPNL =
+            userPNL - int256(_calculateOpenFee(userPositionDetails.collateralAfterFee, userPositionDetails.leverage));
+        return userPNL;
+    }
+
+    function _updatePairTotalBorrowed(uint256 orderType, uint256 pairIndex, uint256 positionSize) private {
+        //This may be a little extra and not necessary
+        //Here we are checking if the order is a long or short
+        if (orderType == 0) {
+            //orderType = PositionDirection.LONG;
+
+            //update the total borrowed amount for long or short postion of an asset
+            //make sure to test this math
+            s_assetPairDetails[pairIndex].assetTotalLongs += (positionSize);
+        }
+        if (orderType == 1) {
+            //orderType = PositionDirection.SHORT;
+            s_assetPairDetails[pairIndex].assetTotalShorts += (positionSize);
+        }
+    }
+
+    function _sendFunds(address user, uint256 amount) private {
+        bool success = IERC20(s_tokenCollateralAddress).transferFrom(user, address(this), amount);
         if (!success) {
             revert OrderBook__TransferFailed();
         }
-        uint256 openFee = _calculateOpenFee(pairIndex, amountCollateral, leverage, orderType);
-        uint256 collateralAfterFee = amountCollateral - openFee;
-        //This needs to be changed to a oracle
-        uint256 openTime = block.timestamp;
-        uint256 openPrice = 0.5 ether;
-
-        s_userOpenTrades[msg.sender]++;
-
-        //We might be able to just store the total position size and not the collateral amount and leverage
-
-        s_userTrades[msg.sender][pairIndex] = [pairIndex, openPrice, collateralAfterFee, leverage, orderType, openTime];
-
-        emit MarketTrade(msg.sender, pairIndex, collateralAfterFee * leverage);
     }
 
-    function orderClose(uint256 tradeIndex) public userPositionExist(msg.sender, tradeIndex) nonReentrant {
-        /* [uint256 pairIndex,
-            uint256 openPrice,
-            uint256 amountCollateral,
-            uint256 leverage,
-            uint256 orderType,
-            uint256 openTime,]
-         = s_userTrades[msg.sender][tradeIndex]; */
-
-        uint256[] memory orderDetails = s_userTrades[msg.sender][tradeIndex];
-
-        uint256 pairIndex = orderDetails[1];
-        uint256 openPrice = orderDetails[2];
-        uint256 amountCollateral = orderDetails[3];
-        uint256 leverage = orderDetails[4];
-        uint256 orderType = orderDetails[5];
-        uint256 openTime = orderDetails[6];
-
-        uint256 feePercentage;
-
-        //get price with teh pairIndex
-        uint256 closePrice = 1 ether;
-
-        if (orderType == 1) {
-            (feePercentage,) = calculateBorrowFee(pairIndex, amountCollateral, leverage, orderType);
+    function _order(
+        address user,
+        uint256 pairIndex,
+        uint256 amountCollateral,
+        uint256 leverage,
+        uint256 orderType,
+        bytes[] calldata priceUpdateData
+    ) private {
+        //Watchout for math overflow
+        //Here we are getting the openFee and subtracting it from the collateral
+        uint256 collateralAfterFee;
+        {
+            collateralAfterFee = amountCollateral - _calculateOpenFee(amountCollateral, leverage);
         }
 
-        if (orderType == 2) {
-            (, feePercentage) = calculateBorrowFee(pairIndex, amountCollateral, leverage, orderType);
-        }
+        //Here we are incrementing the number of trades a user has open for a certain asset
+        //currently the max number of trades is set at 3
+        s_userOpenTrades[user][pairIndex]++;
 
-        //This needs to be made an average based on the ratio of users long and short postions
-        uint256 totalBorrowFee = feePercentage * leverage * amountCollateral * (block.timestamp - openTime);
-        int256 userPNL;
-        uint256 userTradeChange;
-        bool priceIncrease;
+        _updatePairTotalBorrowed(orderType, pairIndex, collateralAfterFee * leverage);
 
-        //For now we will have a static borrow fee
-        /* if (openPrice >= closePrice) {
-            //before closing fee
-            userTradeChange = (openPrice - closePrice) * leverage * amountCollateral;
-            priceIncrease = true;
-        }
-        if( openPrice <= closePrice){
-            userTradeChange = (closePrice-openPrice) * leverage * amountCollateral;
-            priceIncrease = false;
-        }
-        */
-        if (orderType == 1) {
-            userPNL = int256((closePrice - openPrice) * leverage * amountCollateral);
-        }
-        if (orderType == 2) {
-            userPNL = int256((openPrice - closePrice) * leverage * amountCollateral);
-        }
+        //update the total borrowed amount for long or short postion of an asset
+        //make sure to test this math
 
-        userPNL = userPNL - int256(_calculateOpenFee(pairIndex, amountCollateral, leverage, orderType) - totalBorrowFee);
-        //reset the trading book
-        delete s_userTrades[msg.sender][pairIndex];
-        if (userPNL >= 0) {
-            uint256 uintUserPNL = uint256(userPNL);
-            bool success = IERC20(s_tokenCollateralAddress).transferFrom(msg.sender, address(this), uintUserPNL);
-            if (!success) {
-                revert OrderBook__TransferFailed();
-            }
-        }
+        PythStructs.Price memory priceData = getTradingPairCurrentPrice(priceUpdateData, pairIndex);
 
-        emit OrderClosed(msg.sender, pairIndex, userPNL);
+        //Here we are updating the user's trade position
+        s_userTradeDetails[user][pairIndex][s_userOpenTrades[user][pairIndex]] = PositionDetails(
+            pairIndex,
+            uint64(priceData.price),
+            collateralAfterFee,
+            leverage,
+            orderType,
+            priceData.publishTime,
+            uint256(1) //currently just a placeholder
+        );
     }
 
-    function _calculateOpenFee(uint256 pairIndex, uint256 amountCollateral, uint256 leverage, uint256 orderType)
-        private
-        view
-        returns (uint256 openFee)
-    {
+    function _calculateOpenFee(uint256 amountCollateral, uint256 leverage) private view returns (uint256 openFee) {
         uint256 positionSize = amountCollateral * leverage;
         openFee = positionSize * s_openFeePercentage / FEE_PRECISION;
     }
 
-    function calculateBorrowFee(uint256 pairIndex, uint256 amountCollateral, uint256 leverage, uint256 orderType)
+    //We want this to be dynamic and change as the amount of long and shorts change
+    function _calculateBorrowFee(address user, uint256 pairIndex, uint256 openTradesIdForPair)
         private
         view
-        returns (uint256 borrowFeeLong, uint256 borrowFeeShort)
+        returns (int256 borrowFee)
     {
-        uint256 longTotal = s_longShortTotal[pairIndex][LONG_POSITION];
-        uint256 shortTotal = s_longShortTotal[pairIndex][SHORT_POSITION];
-        if (longTotal == shortTotal) {
-            return (borrowFeeLong = s_baseBorrowFeePercentage, borrowFeeShort = s_baseBorrowFeePercentage);
+        uint256 borrowRatio =
+            s_assetPairDetails[pairIndex].assetTotalLongs / s_assetPairDetails[pairIndex].assetTotalShorts;
+
+        uint256 orderType = s_userTradeDetails[user][pairIndex][openTradesIdForPair].longShort;
+
+        //This needs to be checked expecially when dealing with different types
+        //For longs
+        //We could simplify this more but for now it will work
+        if (orderType == 0) {
+            return borrowFee = int256(s_baseBorrowFeePercentage - s_baseBorrowFeePercentage * (1 - borrowRatio));
         }
-        if (longTotal > shortTotal) {
-            uint256 difference = longTotal - shortTotal;
-            return (borrowFeeLong = s_baseBorrowFeePercentage * difference, borrowFeeShort = s_baseBorrowFeePercentage);
+
+        //For shorts
+        if (orderType == 1) {
+            return borrowFee = int256(s_baseBorrowFeePercentage + s_baseBorrowFeePercentage * (1 - borrowRatio));
         }
-        if (longTotal < shortTotal) {
-            uint256 difference = shortTotal - longTotal;
-            return (borrowFeeLong = s_baseBorrowFeePercentage, borrowFeeShort = s_baseBorrowFeePercentage * difference);
+        //if none of the conditions are met we will just return the base fee
+        return borrowFee = int256(s_baseBorrowFeePercentage);
+    }
+
+    // The priceUpdateData needs to be retrieved from pyth API
+    function getTradingPairCurrentPrice(bytes[] calldata priceUpdateData, uint256 pairIndex)
+        public
+        payable
+        returns (PythStructs.Price memory)
+    {
+        uint256 updateFee = pyth.getUpdateFee(priceUpdateData);
+        pyth.updatePriceFeeds{value: updateFee}(priceUpdateData);
+        //Here we have 1 for ethereum, this needs to be changed
+        return (pyth.getPrice(s_assetPairDetails[pairIndex].pythPriceFeedAddress));
+    }
+
+    /////////////////////////////
+    // view and pure functions //
+    ////////////////////////////
+
+    function getUserTradingPositionDetails(address user, uint256 tradeIndex, uint256 openTradesIdForPair)
+        external
+        view
+        returns (PositionDetails memory)
+    {
+        return s_userTradeDetails[user][tradeIndex][openTradesIdForPair];
+    }
+
+    function getAssetPairDetails(uint256 pairIndex) external view returns (AssetPairDetails memory) {
+        return s_assetPairDetails[pairIndex];
+    }
+
+    function getUserOpenTradesForAsset(address user, uint256 pairIndex) external view returns (uint256) {
+        return s_userOpenTrades[user][pairIndex];
+    }
+
+    function getUserLiquidationPrice(address user, uint256 assetPairIndex, uint256 openTradeIdForPair)
+        external
+        view
+        returns (int256 liquidationPrice)
+    {
+        PositionDetails memory positionDetails = s_userTradeDetails[user][assetPairIndex][openTradeIdForPair];
+
+        int256 borrowFeePercentage = _calculateBorrowFee(user, assetPairIndex, openTradeIdForPair);
+
+        int256 borrowFeeAmount = borrowFeePercentage * int256(block.timestamp - positionDetails.openTime)
+            * int256(positionDetails.collateralAfterFee * positionDetails.leverage);
+
+        if (positionDetails.longShort == 0) {
+            liquidationPrice = int256(positionDetails.collateralAfterFee / positionDetails.leverage)
+                - (int256(uint256((positionDetails.openPrice))) - borrowFeeAmount);
+            return liquidationPrice;
+        }
+
+        if (positionDetails.longShort == 1) {
+            liquidationPrice = int256(positionDetails.collateralAfterFee / positionDetails.leverage)
+                + (int256(uint256((positionDetails.openPrice))) - borrowFeeAmount);
+            return liquidationPrice;
         }
     }
 }
