@@ -1,5 +1,7 @@
 ## This decentralized leverage trading dapp
 
+Frontend can be found (here)[https://github.com/IzuMan0x/decentralized-leveraged-trading-frontend]
+
 ## Proposed design is as follows
 
 1. Mapping of user to trade pair to an array of position details
