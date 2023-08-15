@@ -33,6 +33,7 @@ contract OrderBook is ReentrancyGuard, Ownable {
     ////////////////////
     //Errors          //
     ////////////////////
+    error OrderBook__ParameterArraysMustBeTheSameLength();
     error OrderBook__NeedsMoreThanZero();
     error OrderBook__UserClosingNonExistingPosition();
     error OrderBook__InvalidTradingPair();
@@ -40,6 +41,7 @@ contract OrderBook is ReentrancyGuard, Ownable {
     error OrderBook__TransferFailed();
     error OrderBook__MaxLeverageIs150();
     error OrderBook__InvalidOrderType();
+    error OrderBook__UserPositionNotOpenForLiquidation();
 
     ////////////////////
     // State Variables //
@@ -47,7 +49,7 @@ contract OrderBook is ReentrancyGuard, Ownable {
     IPyth pyth;
 
     //note enums start at zero so LONG=0 and SHORT=1
-
+    //This may be unecessary currently not being used
     enum PositionDirection {
         LONG,
         SHORT
@@ -62,17 +64,20 @@ contract OrderBook is ReentrancyGuard, Ownable {
         uint256 leverage;
         uint256 longShort; //0 for long and 1 for short
         uint256 openTime;
-        uint256 placeHolder; //maybe we will need this later...
+        uint256 indexBorrowPercentArray;
     }
-    //maybe put in fee here if we want each asset to have a ddifferent fee
+    //maybe put in fee here if we want each asset to have a different fee
 
     struct AssetPairDetails {
         bytes32 pythPriceFeedAddress;
         uint256 assetTotalShorts;
         uint256 assetTotalLongs;
+        //the following two will be used to calculate the borrow fee for a pair
+        uint256[] longShortRatio;
+        uint256[] time;
+        string pairSymbol;
     }
 
-    //note the following will be replaced by the enum
     uint256 private constant LONG_POSITION = 1;
     uint256 private constant SHORT_POSITION = 2;
     uint256 private constant FEE_PRECISION = 1_000_000; //or 1e6
@@ -86,30 +91,33 @@ contract OrderBook is ReentrancyGuard, Ownable {
 
     //This needs to be tested
     uint256 private s_baseBorrowFeePercentage; // 0.001%/h or 1000
+    ///we need to add a rollerover fee as well
+
+    //number of asset pairs currently available on the contract
+    //we will use this iterate through the mapping retreive all the asset pairs
+    //This will be set in the constructor should be updateable
+    uint256 private s_numberOfAvailableAssetPairs;
 
     //Lets say 1: eth/usd 2: wbtc/usd 3: XRP/USD
     //Maybe change the mappings a bit and create an order struct in another contract
     mapping(uint256 assetPairIndex => AssetPairDetails assetPairDetails) private s_assetPairDetails;
+
     mapping(
         address userAddress
             => mapping(
                 uint256 assetPairIndex => mapping(uint256 openTradesIncrementer => PositionDetails positionDetails)
             )
     ) private s_userTradeDetails;
-    //
+
+    //This may be unnecessary
     mapping(address userAddress => mapping(uint256 pairIndex => uint256 numberOfOpenTrades)) private s_userOpenTrades;
-
-    //The following will be removed by the new assetPair struct
-    //Maybe change the following mapping to an enum or struct
-    //mapping(uint256 pairIndex => uint256[] totalPositionsSize) private s_longShortTotal; //uint256[] index 1 is for longs and index 2 is for shorts index 0 should be empty
-
-    //Lets slim down the mappings for asset pair and create a struct for an asset pair that has the price feed address, amount of short and the amount of long positions
 
     ////////////////////
     // Events         //
     ///////////////////
     event OrderClosed(address indexed user, uint256 indexed pairIndex, int256 indexed userPNL);
     event MarketTrade(address indexed user, uint256 indexed pairIndex);
+    event UserLiquidated(address indexed user, uint256 pairIndex, int256 userPNL);
 
     ////////////////////
     // Modifiers      //
@@ -165,19 +173,33 @@ contract OrderBook is ReentrancyGuard, Ownable {
     // Constructor    //
     ////////////////////
     constructor(
-        address pythPriceFeedAddress,
+        address pythPriceFeedAddress, //pyth contract address
         address tokenCollateralAddress,
         uint256 openFeePercentage,
         uint256 closingFeePercentage,
         uint256 baseBorrowFeePercentage,
-        bytes32 pairPriceFeedAddressId
+        bytes32[] memory pairPriceFeedAddressId, //pyth price id for a certain pair
+        uint256[] memory pairIndex,
+        string[] memory pairSymbol
     ) {
+        //make sure the parameter arrays are the same size
+        //maybe move this to a modifier to use for other functions
+        if (pairPriceFeedAddressId.length != pairIndex.length) {
+            revert OrderBook__ParameterArraysMustBeTheSameLength();
+        }
+        if (pairIndex.length != pairSymbol.length) {
+            revert OrderBook__ParameterArraysMustBeTheSameLength();
+        }
         s_tokenCollateralAddress = tokenCollateralAddress;
         s_openFeePercentage = openFeePercentage;
         s_closingFeePercentage = closingFeePercentage;
         s_baseBorrowFeePercentage = baseBorrowFeePercentage;
+        s_numberOfAvailableAssetPairs = pairPriceFeedAddressId.length;
         pyth = IPyth(pythPriceFeedAddress);
-        s_assetPairDetails[1].pythPriceFeedAddress = pairPriceFeedAddressId;
+        for (uint256 i = 0; i < pairPriceFeedAddressId.length; i++) {
+            s_assetPairDetails[i].pythPriceFeedAddress = pairPriceFeedAddressId[i];
+            s_assetPairDetails[i].pairSymbol = pairSymbol[i];
+        }
     }
 
     //we will refactor the marketorder function
@@ -219,6 +241,8 @@ contract OrderBook is ReentrancyGuard, Ownable {
 
         //reset the trading book
         delete s_userTradeDetails[msg.sender][userPositionDetails.pairNumber][userTradesIdForPair];
+        //subtracting the number of open trades
+        s_userOpenTrades[msg.sender][userPositionDetails.pairNumber]--;
 
         if (userPNL >= 0) {
             uint256 uintUserPNL = uint256(userPNL);
@@ -226,6 +250,25 @@ contract OrderBook is ReentrancyGuard, Ownable {
         }
 
         emit OrderClosed(msg.sender, userPositionDetails.pairNumber, userPNL);
+    }
+
+    function liquidateUser(
+        address user,
+        uint256 tradeIndex,
+        uint256 userTradesIdForPair,
+        bytes[] calldata priceUpdateData
+    ) public userPositionExist(user, tradeIndex, userTradesIdForPair) nonReentrant {
+        PositionDetails memory userPositionDetails = s_userTradeDetails[user][tradeIndex][userTradesIdForPair];
+
+        int256 userPNL = _getUserPNL(msg.sender, userPositionDetails, userTradesIdForPair, priceUpdateData);
+
+        if (userPNL <= 0) {
+            delete s_userTradeDetails[user][userPositionDetails.pairNumber][userTradesIdForPair];
+            s_userOpenTrades[user][userPositionDetails.pairNumber]--;
+            emit UserLiquidated(user, userPositionDetails.pairNumber, userPNL);
+        } else {
+            revert OrderBook__UserPositionNotOpenForLiquidation();
+        }
     }
 
     //////////////////////
@@ -341,7 +384,14 @@ contract OrderBook is ReentrancyGuard, Ownable {
         //currently the max number of trades is set at 3
         s_userOpenTrades[user][pairIndex]++;
 
+        //updating the total amount borrow for long or short positions, this should be updated everytime a trade is opened or closed
         _updatePairTotalBorrowed(orderType, pairIndex, collateralAfterFee * leverage);
+
+        s_assetPairDetails[pairIndex].time.push(block.timestamp);
+
+        s_assetPairDetails[pairIndex].longShortRatio.push(
+            s_assetPairDetails[pairIndex].assetTotalLongs / s_assetPairDetails[pairIndex].assetTotalShorts
+        );
 
         //update the total borrowed amount for long or short postion of an asset
         //make sure to test this math
@@ -356,7 +406,7 @@ contract OrderBook is ReentrancyGuard, Ownable {
             leverage,
             orderType,
             priceData.publishTime,
-            uint256(1) //currently just a placeholder
+            (s_assetPairDetails[pairIndex].time.length - 1) //here we are getting the index for when we need to calculate the borrow fee when the order is closed
         );
     }
 
@@ -371,8 +421,20 @@ contract OrderBook is ReentrancyGuard, Ownable {
         view
         returns (int256 borrowFee)
     {
-        uint256 borrowRatio =
-            s_assetPairDetails[pairIndex].assetTotalLongs / s_assetPairDetails[pairIndex].assetTotalShorts;
+        //the following logic is not correct
+
+        /* uint256 borrowRatio =
+            s_assetPairDetails[pairIndex].assetTotalLongs / s_assetPairDetails[pairIndex].assetTotalShorts; */
+
+        //Here it is correct
+        uint256 sum;
+        for (uint256 i = 0; i < s_assetPairDetails[pairIndex].time.length; i++) {
+            sum = sum
+                + s_assetPairDetails[pairIndex].longShortRatio[i]
+                    * (s_assetPairDetails[pairIndex].time[i + 1] - s_assetPairDetails[pairIndex].time[i]);
+        }
+
+        uint256 avgBorrowRatio = sum / s_assetPairDetails[pairIndex].time.length;
 
         uint256 orderType = s_userTradeDetails[user][pairIndex][openTradesIdForPair].longShort;
 
@@ -380,12 +442,12 @@ contract OrderBook is ReentrancyGuard, Ownable {
         //For longs
         //We could simplify this more but for now it will work
         if (orderType == 0) {
-            return borrowFee = int256(s_baseBorrowFeePercentage - s_baseBorrowFeePercentage * (1 - borrowRatio));
+            return borrowFee = int256(s_baseBorrowFeePercentage - s_baseBorrowFeePercentage * (1 - avgBorrowRatio));
         }
 
         //For shorts
         if (orderType == 1) {
-            return borrowFee = int256(s_baseBorrowFeePercentage + s_baseBorrowFeePercentage * (1 - borrowRatio));
+            return borrowFee = int256(s_baseBorrowFeePercentage + s_baseBorrowFeePercentage * (1 - avgBorrowRatio));
         }
         //if none of the conditions are met we will just return the base fee
         return borrowFee = int256(s_baseBorrowFeePercentage);
@@ -446,5 +508,21 @@ contract OrderBook is ReentrancyGuard, Ownable {
                 + (int256(uint256((positionDetails.openPrice))) - borrowFeeAmount);
             return liquidationPrice;
         }
+    }
+
+    function getTotalLongAmount(uint256 pairIndex) external view returns (uint256) {
+        return s_assetPairDetails[pairIndex].assetTotalLongs;
+    }
+
+    function getTotalShortAmount(uint256 pairIndex) external view returns (uint256) {
+        return s_assetPairDetails[pairIndex].assetTotalShorts;
+    }
+
+    function getAssetPairIndexSymbol() external view returns (string[] memory) {
+        string[] memory listOfPairSymbols;
+        for (uint256 i = 0; i < s_numberOfAvailableAssetPairs; i++) {
+            listOfPairSymbols[i] = s_assetPairDetails[i].pairSymbol;
+        }
+        return listOfPairSymbols;
     }
 }
