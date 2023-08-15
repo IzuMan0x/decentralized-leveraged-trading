@@ -519,10 +519,18 @@ contract OrderBook is ReentrancyGuard, Ownable {
     }
 
     function getAssetPairIndexSymbol() external view returns (string[] memory) {
-        string[] memory listOfPairSymbols;
+        //Before it was a dyanmic array string[] memory listOfPairSymbols;
+        //Now we set the size statically
+        //previously, it through an error array index out of bounds, may have to do with how memory arrays act differently than storage arrays
+        //current code works. Above notes are just for reference
+        string[] memory listOfPairSymbols = new string[](s_numberOfAvailableAssetPairs);
         for (uint256 i = 0; i < s_numberOfAvailableAssetPairs; i++) {
-            listOfPairSymbols[i] = s_assetPairDetails[i].pairSymbol;
+            listOfPairSymbols[i] = (s_assetPairDetails[i].pairSymbol);
         }
         return listOfPairSymbols;
+    }
+
+    function getPythPriceFeedAddress() external view returns (address) {
+        return address(pyth);
     }
 }

@@ -5,6 +5,8 @@ import {MockPyth} from "@pyth-sdk-solidity/MockPyth.sol";
 import {ERC20Mock} from "@openzeppelin/contracts/mocks/ERC20Mock.sol";
 import {console} from "forge-std/console.sol";
 import {Script} from "forge-std/Script.sol";
+//Paste the follwing into the command line to deploy the contract on a local testnet
+//forge script script/DeployOrderBook.s.sol:DeployOrderBook --rpc-url http://127.0.0.1:8545 --broadcast
 
 contract HelperConfig is Script {
     NetworkConfig public activeNetworkConfig;
@@ -17,7 +19,7 @@ contract HelperConfig is Script {
         uint256 deployerKey;
     }
 
-    uint256 public DEFAULT_ANVIL_PRIVATE_KEY = 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80;
+    uint256 public DEFAULT_ANVIL_PRIVATE_KEY = 0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d;
 
     constructor() {
         if (block.chainid == 11155111) {
@@ -46,12 +48,13 @@ contract HelperConfig is Script {
             return activeNetworkConfig;
         }
 
-        vm.startBroadcast();
+        vm.startBroadcast(DEFAULT_ANVIL_PRIVATE_KEY);
         // Creating a mock of Pyth contract with 60 seconds validTimePeriod (for staleness)
         // and 1 wei fee for updating the price.
         MockPyth mockPyth = new MockPyth(60, 1);
 
         ERC20Mock usdcMock = new ERC20Mock();
+        usdcMock.mint(address(0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266), 1_000_000 ether);
 
         ERC20Mock wethMock = new ERC20Mock();
 
