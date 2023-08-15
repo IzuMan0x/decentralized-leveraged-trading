@@ -1,6 +1,6 @@
 ## This decentralized leverage trading dapp
 
-Frontend can be found [here](ttps://github.com/IzuMan0x/decentralized-leveraged-trading-frontend)
+Frontend can be found [here](https://github.com/IzuMan0x/decentralized-leveraged-trading-frontend)
 
 ## Proposed design is as follows
 
