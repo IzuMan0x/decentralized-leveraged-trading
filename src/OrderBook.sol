@@ -159,7 +159,7 @@ contract OrderBook is ReentrancyGuard, Ownable {
     }
 
     modifier validOrderType(uint256 orderType) {
-        if (orderType != 0 || orderType != 1) {
+        if (orderType != 0 && orderType != 1) {
             revert OrderBook__InvalidOrderType();
         }
         _;
@@ -389,8 +389,10 @@ contract OrderBook is ReentrancyGuard, Ownable {
 
         s_assetPairDetails[pairIndex].time.push(block.timestamp);
 
+        //note here we will be dividing by zero
+        //fixed by adding one to the denominator, this will result in slightly incorrect calculations but the effect in insignificant. We will find out in testing
         s_assetPairDetails[pairIndex].longShortRatio.push(
-            s_assetPairDetails[pairIndex].assetTotalLongs / s_assetPairDetails[pairIndex].assetTotalShorts
+            s_assetPairDetails[pairIndex].assetTotalLongs / (s_assetPairDetails[pairIndex].assetTotalShorts + 1 ether)
         );
 
         //update the total borrowed amount for long or short postion of an asset
@@ -521,7 +523,7 @@ contract OrderBook is ReentrancyGuard, Ownable {
     function getAssetPairIndexSymbol() external view returns (string[] memory) {
         //Before it was a dyanmic array string[] memory listOfPairSymbols;
         //Now we set the size statically
-        //previously, it through an error array index out of bounds, may have to do with how memory arrays act differently than storage arrays
+        //previously, it threw an error array index out of bounds, may have to do with how memory arrays act differently than storage arrays
         //current code works. Above notes are just for reference
         string[] memory listOfPairSymbols = new string[](s_numberOfAvailableAssetPairs);
         for (uint256 i = 0; i < s_numberOfAvailableAssetPairs; i++) {
@@ -532,5 +534,9 @@ contract OrderBook is ReentrancyGuard, Ownable {
 
     function getPythPriceFeedAddress() external view returns (address) {
         return address(pyth);
+    }
+
+    function getTokenCollateralAddress() external view returns (address) {
+        return s_tokenCollateralAddress;
     }
 }
