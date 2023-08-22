@@ -23,6 +23,8 @@ contract DeployOrderBook is Script {
     //This needs to be tested
     uint256 private constant BASE_BORROW_FEE_PERCENTAGE = 1000; // 0.001%/h or 1000
 
+    int256[] private MAX_OPEN_INTEREST = [int256(500_000 ether), int256(500_000 ether)];
+
     //price feed Ids, were being returned in the helper config but arrays are a little tricky so it is here for now
     //These are for testing and index 0 is ETH and index 1 is BTC
     bytes32[] private priceFeedIdArray = [
@@ -46,7 +48,7 @@ contract DeployOrderBook is Script {
         vm.startBroadcast(deployerKey);
 
         orderBook =
-            new OrderBook(address(pythPriceFeedAddress), address(usdc), priceFeedIdArray, PAIR_INDEX, PAIR_SYMBOL);
+        new OrderBook(address(pythPriceFeedAddress), address(usdc), priceFeedIdArray, MAX_OPEN_INTEREST, PAIR_INDEX, PAIR_SYMBOL);
 
         vm.stopBroadcast();
         return (orderBook, helperConfig);

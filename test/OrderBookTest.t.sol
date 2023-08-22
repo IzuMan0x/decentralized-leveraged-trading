@@ -20,14 +20,18 @@ contract OrderBookTest is Test {
     //Pair Index 0 for eth 1 for btc
     uint256 private constant PAIR_INDEX_ETHER = 0;
     uint256 private constant PAIR_INDEX_BTC = 1;
-    uint256 private constant AMOUNT_COLLATERAL = 100 ether;
-    uint256 private constant LEVERAGE = 10 * 1e6; //becasue the precision is 6 decimal
-    uint8 private constant ORDER_TYPE = 0;
+    int256 private constant AMOUNT_COLLATERAL = 100 ether;
+    int256 private constant LEVERAGE = 10 * 1e6; //becasue the precision is 6 decimal
+    uint8 private constant ORDER_TYPE = 1;
+
+    bytes32 constant ETH_PRICE_ID = 0x000000000000000000000000000000000000000000000000000000000000abcd;
 
     //user trade index
     uint256 private constant USER_TRADE_INDEX_FIRST = 1;
     uint256 private constant USER_TRADE_INDEX_SECOND = 2;
     uint256 private constant USER_TRADE_INDEX_THIRD = 3;
+
+    int256[] private MAX_OPEN_INTEREST = [int256(500_000 ether), int256(500_000 ether)];
 
     ERC20Mock baseToken;
     address payable constant BASE_TOKEN_MINT = payable(0x0000000000000000000000000000000000000011);
@@ -48,6 +52,7 @@ contract OrderBookTest is Test {
     uint256 deployerKey;
 
     address traderBigMoney = makeAddr("traderBigMoney");
+    address liquidator = makeAddr("liquidator");
 
     function setUp() public {
         DeployOrderBook deployer = new DeployOrderBook();
@@ -58,6 +63,7 @@ contract OrderBookTest is Test {
         ERC20Mock(usdc).approve(address(orderBook), MAX_INT);
         ERC20Mock(usdc).mint(traderBigMoney, 1_000_000 ether);
         vm.deal(traderBigMoney, 1_000 ether);
+        vm.deal(liquidator, 1_000 ether);
     }
 
     ///////////////////////
@@ -77,12 +83,13 @@ contract OrderBookTest is Test {
 
         vm.expectRevert(OrderBook.OrderBook__ParameterArraysMustBeTheSameLength.selector);
         orderBook =
-        new OrderBook(address(pythPriceFeedAddress), address(usdc), priceFeedIdArray, pairIndexArray, pairSymbolArray);
+        new OrderBook(address(pythPriceFeedAddress), address(usdc), priceFeedIdArray, MAX_OPEN_INTEREST, pairIndexArray, pairSymbolArray);
     }
 
     ////////////////////////////////
     // marketOrder Function Tests //
     ///////////////////////////////
+    //general note console.log() cannot handler int, structs and the list probably goes on
 
     function testMarketOrderCanBeMadeAndRecorded() public {
         vm.startPrank(traderBigMoney);
@@ -95,27 +102,58 @@ contract OrderBookTest is Test {
 
         vm.stopPrank();
 
-        uint256 totalLongAmount = orderBook.getTotalLongAmount(PAIR_INDEX_ETHER);
-        console.log("Total amount of longs open are: ", totalLongAmount);
+        int256 totalLongAmount = orderBook.getTotalLongAmount(PAIR_INDEX_ETHER);
+        //console.log("Total amount of longs open are: ", totalLongAmount);
 
         //user position array starts at 1 not zero... for each pairIndex it is possible to have three trades open
         // not sure how this will affect the UI ease of use
         OrderBook.PositionDetails memory positionDetails =
             orderBook.getUserTradingPositionDetails(traderBigMoney, PAIR_INDEX_ETHER, USER_TRADE_INDEX_FIRST);
 
-        uint256 positionCollateral = positionDetails.collateralAfterFee;
-        uint64 openPrice = positionDetails.openPrice;
+        int256 positionCollateral = positionDetails.collateralAfterFee;
+        int256 openPrice = positionDetails.openPrice;
 
-        console.log("User position collateral is: ", positionCollateral);
-        console.log("User open price was: ", openPrice);
+        //console.log("User position collateral is: ", positionCollateral);
+        //console.log("User open price was: ", openPrice);
 
-        skip(36000);
+        uint256 startTime = block.timestamp;
+        //console.log("Current time is: ", startTime);
+
+        skip(5 days);
+
+        //trader will be in liquidation zone
 
         (int256 liquidationPriceInt, int256 borrowFeeAmountInt) =
             orderBook.getUserLiquidationPrice(traderBigMoney, PAIR_INDEX_ETHER, USER_TRADE_INDEX_FIRST);
         uint256 borrowFeeAmount = uint256(borrowFeeAmountInt);
         uint256 liquidationPrice = uint256(liquidationPriceInt);
         console.log("User borrow fee is: ", borrowFeeAmount);
-        console.log("User liquidaion price is: ", liquidationPrice);
+        //console.log("User liquidaion price is: ", liquidationPrice);
+
+        vm.startPrank(liquidator);
+
+        bytes[] memory updateDataArray = new bytes[](1);
+
+        bytes memory updateData;
+
+        // This is a dummy update data for Eth. It shows the price as $1000 +- $10 (with -5 exponent).
+        int32 ethPrice = 1070;
+        int32 btcPrice = 2000;
+        //Here we are updating the pyth price feed so we can read from it later
+        updateDataArray[0] = MockPyth(pythPriceFeedAddress).createPriceFeedUpdateData(
+            ETH_PRICE_ID, ethPrice * 100000, 10 * 100000, -5, ethPrice * 100000, 10 * 100000, uint64(block.timestamp)
+        );
+
+        (int256 liquidationPriceInt2, int256 borrowFeeAmountInt2) =
+            orderBook.getUserLiquidationPrice(traderBigMoney, PAIR_INDEX_ETHER, USER_TRADE_INDEX_FIRST);
+
+        uint256 value = MockPyth(pythPriceFeedAddress).getUpdateFee(updateDataArray);
+        OrderBook.PositionDetails memory positionDetailsAfterTimePassed =
+            orderBook.getUserTradingPositionDetails(traderBigMoney, PAIR_INDEX_ETHER, USER_TRADE_INDEX_FIRST);
+
+        orderBook.liquidateUser{value: 1}(traderBigMoney, PAIR_INDEX_ETHER, USER_TRADE_INDEX_FIRST, updateDataArray);
+        orderBook.liquidateUser{value: 1}(traderBigMoney, PAIR_INDEX_ETHER, USER_TRADE_INDEX_FIRST, updateDataArray);
+
+        vm.stopPrank();
     }
 }
