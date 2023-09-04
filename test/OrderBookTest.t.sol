@@ -20,16 +20,20 @@ contract OrderBookTest is Test {
     //Pair Index 0 for eth 1 for btc
     uint256 private constant PAIR_INDEX_ETHER = 0;
     uint256 private constant PAIR_INDEX_BTC = 1;
-    int256 private constant AMOUNT_COLLATERAL = 100 ether;
+    uint256 private constant INVALID_PAIR_INDEX = 5;
+    int256 private constant AMOUNT_COLLATERAL = 1000 ether;
     int256 private constant LEVERAGE = 10 * 1e6; //becasue the precision is 6 decimal
-    uint8 private constant ORDER_TYPE = 1;
+    int256 private constant MAX_LEVERAGE = 150 * 1e6;
+    int256 private constant OVER_LEVERAGED = 151 * 1e6;
+    uint8 private constant ORDER_TYPE_LONG = 0;
+    uint8 private constant ORDER_TYPE_SHORT = 1;
 
     bytes32 constant ETH_PRICE_ID = 0x000000000000000000000000000000000000000000000000000000000000abcd;
 
     //user trade index
-    uint256 private constant USER_TRADE_INDEX_FIRST = 1;
-    uint256 private constant USER_TRADE_INDEX_SECOND = 2;
-    uint256 private constant USER_TRADE_INDEX_THIRD = 3;
+    uint256 private constant USER_TRADE_INDEX_FIRST = 2;
+    uint256 private constant USER_TRADE_INDEX_SECOND = 1;
+    uint256 private constant USER_TRADE_INDEX_THIRD = 0;
 
     int256[] private MAX_OPEN_INTEREST = [int256(500_000 ether), int256(500_000 ether)];
 
@@ -52,6 +56,7 @@ contract OrderBookTest is Test {
     uint256 deployerKey;
 
     address traderBigMoney = makeAddr("traderBigMoney");
+    address traderLoser = makeAddr("traderLoser");
     address liquidator = makeAddr("liquidator");
 
     function setUp() public {
@@ -59,11 +64,17 @@ contract OrderBookTest is Test {
         (orderBook, helperConfig) = deployer.run();
 
         (pythPriceFeedAddress, pythUpdateData, usdc, weth, wbtc, deployerKey) = helperConfig.activeNetworkConfig();
+        //Starting price is set in the helper config currently set @ $1000
         pythUpdateDataArray = [pythUpdateData];
         ERC20Mock(usdc).approve(address(orderBook), MAX_INT);
         ERC20Mock(usdc).mint(traderBigMoney, 1_000_000 ether);
+        ERC20Mock(usdc).mint(traderLoser, 1_000_000 ether);
         vm.deal(traderBigMoney, 1_000 ether);
+        vm.deal(traderLoser, 1_000 ether);
         vm.deal(liquidator, 1_000 ether);
+        vm.startPrank(traderLoser);
+        ERC20Mock(usdc).approve(address(orderBook), MAX_INT);
+        vm.stopPrank();
     }
 
     ///////////////////////
@@ -89,21 +100,24 @@ contract OrderBookTest is Test {
     ////////////////////////////////
     // marketOrder Function Tests //
     ///////////////////////////////
-    //general note console.log() cannot handler int, structs and the list probably goes on
+    //general note console.log() cannot handle int, structs and there are probably more types...
 
     function testMarketOrderCanBeMadeAndRecorded() public {
+        //traderBigMoney is opening his winning trade😜
         vm.startPrank(traderBigMoney);
         uint256 userUsdcBalance = ERC20Mock(usdc).balanceOf(traderBigMoney);
         uint256 userBalance = traderBigMoney.balance;
         console.log("User balance of ether is: ", userBalance);
         console.log("User balance of usdc is: ", userUsdcBalance);
         ERC20Mock(usdc).approve(address(orderBook), MAX_INT);
-        orderBook.marketOrder{value: 1}(PAIR_INDEX_ETHER, AMOUNT_COLLATERAL, LEVERAGE, ORDER_TYPE, pythUpdateDataArray);
+        orderBook.marketOrder{value: 1}(
+            PAIR_INDEX_ETHER, AMOUNT_COLLATERAL, LEVERAGE, ORDER_TYPE_LONG, pythUpdateDataArray
+        );
 
         vm.stopPrank();
 
         int256 totalLongAmount = orderBook.getTotalLongAmount(PAIR_INDEX_ETHER);
-        //console.log("Total amount of longs open are: ", totalLongAmount);
+        console.log("Total amount of longs open are: ", uint256(totalLongAmount));
 
         //user position array starts at 1 not zero... for each pairIndex it is possible to have three trades open
         // not sure how this will affect the UI ease of use
@@ -119,7 +133,7 @@ contract OrderBookTest is Test {
         uint256 startTime = block.timestamp;
         //console.log("Current time is: ", startTime);
 
-        skip(5 days);
+        skip(45 days);
 
         //trader will be in liquidation zone
 
@@ -128,7 +142,7 @@ contract OrderBookTest is Test {
         uint256 borrowFeeAmount = uint256(borrowFeeAmountInt);
         uint256 liquidationPrice = uint256(liquidationPriceInt);
         console.log("User borrow fee is: ", borrowFeeAmount);
-        //console.log("User liquidaion price is: ", liquidationPrice);
+        console.log("User liquidaion price is: ", liquidationPrice);
 
         vm.startPrank(liquidator);
 
@@ -137,7 +151,7 @@ contract OrderBookTest is Test {
         bytes memory updateData;
 
         // This is a dummy update data for Eth. It shows the price as $1000 +- $10 (with -5 exponent).
-        int32 ethPrice = 1070;
+        int32 ethPrice = 1000;
         int32 btcPrice = 2000;
         //Here we are updating the pyth price feed so we can read from it later
         updateDataArray[0] = MockPyth(pythPriceFeedAddress).createPriceFeedUpdateData(
@@ -152,8 +166,238 @@ contract OrderBookTest is Test {
             orderBook.getUserTradingPositionDetails(traderBigMoney, PAIR_INDEX_ETHER, USER_TRADE_INDEX_FIRST);
 
         orderBook.liquidateUser{value: 1}(traderBigMoney, PAIR_INDEX_ETHER, USER_TRADE_INDEX_FIRST, updateDataArray);
+
+        vm.stopPrank();
+    }
+
+    function testOnlyThreeOpenTradesPerPair() public {
+        //traderBigMoney is opening his winning trade😜
+        vm.startPrank(traderBigMoney);
+        ERC20Mock(usdc).approve(address(orderBook), MAX_INT);
+        orderBook.marketOrder{value: 1}(
+            PAIR_INDEX_ETHER, AMOUNT_COLLATERAL, LEVERAGE, ORDER_TYPE_LONG, pythUpdateDataArray
+        );
+        orderBook.marketOrder{value: 1}(
+            PAIR_INDEX_ETHER, AMOUNT_COLLATERAL, LEVERAGE, ORDER_TYPE_LONG, pythUpdateDataArray
+        );
+        orderBook.marketOrder{value: 1}(
+            PAIR_INDEX_ETHER, AMOUNT_COLLATERAL, LEVERAGE, ORDER_TYPE_LONG, pythUpdateDataArray
+        );
+        vm.expectRevert(OrderBook.OrderBook__MaxNumberOfOpenTrades3Reached.selector);
+        orderBook.marketOrder{value: 1}(
+            PAIR_INDEX_ETHER, AMOUNT_COLLATERAL, LEVERAGE, ORDER_TYPE_LONG, pythUpdateDataArray
+        );
+
+        vm.stopPrank();
+    }
+
+    function testMaxLeverageIs150AndRevertsIfOver150() public {
+        vm.startPrank(traderBigMoney);
+        ERC20Mock(usdc).approve(address(orderBook), MAX_INT);
+        orderBook.marketOrder{value: 1}(
+            PAIR_INDEX_ETHER, AMOUNT_COLLATERAL, MAX_LEVERAGE, ORDER_TYPE_LONG, pythUpdateDataArray
+        );
+
+        vm.expectRevert(OrderBook.OrderBook__MaxLeverageIs150.selector);
+        orderBook.marketOrder{value: 1}(
+            PAIR_INDEX_ETHER, AMOUNT_COLLATERAL, OVER_LEVERAGED, ORDER_TYPE_LONG, pythUpdateDataArray
+        );
+
+        vm.stopPrank();
+    }
+
+    function testTradeCanOnlyBeOpenedWithValidPair() public {
+        vm.startPrank(traderBigMoney);
+        ERC20Mock(usdc).approve(address(orderBook), MAX_INT);
+
+        vm.expectRevert(OrderBook.OrderBook__InvalidTradingPair.selector);
+        orderBook.marketOrder{value: 1}(
+            INVALID_PAIR_INDEX, AMOUNT_COLLATERAL, LEVERAGE, ORDER_TYPE_LONG, pythUpdateDataArray
+        );
+
+        vm.stopPrank();
+    }
+
+    function testTradeOfAmountZeroCannotBeOpened() public {
+        vm.startPrank(traderBigMoney);
+        ERC20Mock(usdc).approve(address(orderBook), MAX_INT);
+
+        vm.expectRevert(OrderBook.OrderBook__NeedsMoreThanZero.selector);
+        orderBook.marketOrder{value: 1}(PAIR_INDEX_ETHER, 0, LEVERAGE, ORDER_TYPE_LONG, pythUpdateDataArray);
+
+        vm.stopPrank();
+
+        vm.startPrank(traderBigMoney);
+        ERC20Mock(usdc).approve(address(orderBook), MAX_INT);
+
+        vm.expectRevert(OrderBook.OrderBook__NeedsMoreThanZero.selector);
+        orderBook.marketOrder{value: 1}(PAIR_INDEX_ETHER, AMOUNT_COLLATERAL, 0, ORDER_TYPE_LONG, pythUpdateDataArray);
+
+        vm.stopPrank();
+    }
+
+    function testTraderCanBeLiquidatedByPriceChange() public {
+        vm.startPrank(traderBigMoney);
+        ERC20Mock(usdc).approve(address(orderBook), MAX_INT);
+        orderBook.marketOrder{value: 1}(
+            PAIR_INDEX_ETHER, AMOUNT_COLLATERAL, LEVERAGE, ORDER_TYPE_LONG, pythUpdateDataArray
+        );
+
+        bytes[] memory updateDataArray = new bytes[](1);
+
+        bytes memory updateData;
+        skip(10);
+
+        // This is a dummy update data for Eth. It shows the price as $1000 +- $10 (with -5 exponent).
+        int32 ethPrice = 900;
+        int32 btcPrice = 2000;
+        //Here we are updating the pyth price feed so we can read from it later
+        updateDataArray[0] = MockPyth(pythPriceFeedAddress).createPriceFeedUpdateData(
+            ETH_PRICE_ID, ethPrice * 100000, 10 * 100000, -5, ethPrice * 100000, 10 * 100000, uint64(block.timestamp)
+        );
         orderBook.liquidateUser{value: 1}(traderBigMoney, PAIR_INDEX_ETHER, USER_TRADE_INDEX_FIRST, updateDataArray);
 
         vm.stopPrank();
+    }
+
+    function testTraderCanBeLiquidatedByBorrowFees() public {
+        vm.startPrank(traderBigMoney);
+        ERC20Mock(usdc).approve(address(orderBook), MAX_INT);
+        orderBook.marketOrder{value: 1}(
+            PAIR_INDEX_ETHER, AMOUNT_COLLATERAL, LEVERAGE, ORDER_TYPE_LONG, pythUpdateDataArray
+        );
+
+        bytes[] memory updateDataArray = new bytes[](1);
+
+        bytes memory updateData;
+        skip(55 days);
+
+        // This is a dummy update data for Eth. It shows the price as $1000 +- $10 (with -5 exponent).
+        int32 ethPrice = 1020;
+        int32 btcPrice = 2000;
+        //Here we are updating the pyth price feed so we can read from it later
+        updateDataArray[0] = MockPyth(pythPriceFeedAddress).createPriceFeedUpdateData(
+            ETH_PRICE_ID, ethPrice * 100000, 10 * 100000, -5, ethPrice * 100000, 10 * 100000, uint64(block.timestamp)
+        );
+        orderBook.liquidateUser{value: 1}(traderBigMoney, PAIR_INDEX_ETHER, USER_TRADE_INDEX_FIRST, updateDataArray);
+
+        vm.stopPrank();
+    }
+
+    function testOpenAndCloseATrade() public {
+        vm.startPrank(traderBigMoney);
+        ERC20Mock(usdc).approve(address(orderBook), MAX_INT);
+        orderBook.marketOrder{value: 1}(
+            PAIR_INDEX_ETHER, AMOUNT_COLLATERAL, LEVERAGE, ORDER_TYPE_LONG, pythUpdateDataArray
+        );
+        orderBook.marketOrder{value: 1}(
+            PAIR_INDEX_ETHER, AMOUNT_COLLATERAL, LEVERAGE, ORDER_TYPE_SHORT, pythUpdateDataArray
+        );
+        orderBook.marketOrder{value: 1}(
+            PAIR_INDEX_ETHER, AMOUNT_COLLATERAL, LEVERAGE, ORDER_TYPE_LONG, pythUpdateDataArray
+        );
+
+        /* orderBook.marketOrder{value: 1}(
+            PAIR_INDEX_BTC, AMOUNT_COLLATERAL, LEVERAGE, ORDER_TYPE_LONG, pythUpdateDataArray
+        ) */
+
+        bytes[] memory updateDataArray = new bytes[](1);
+
+        bytes memory updateData;
+        skip(1000);
+
+        // This is a dummy update data for Eth. It shows the price as $1000 +- $10 (with -5 exponent).
+        int32 ethPrice = 500;
+        int32 btcPrice = 2000;
+        //Here we are updating the pyth price feed so we can read from it later
+        updateDataArray[0] = MockPyth(pythPriceFeedAddress).createPriceFeedUpdateData(
+            ETH_PRICE_ID, ethPrice * 100000, 10 * 100000, -5, ethPrice * 100000, 10 * 100000, uint64(block.timestamp)
+        );
+        orderBook.orderClose{value: 1}(PAIR_INDEX_ETHER, USER_TRADE_INDEX_FIRST, updateDataArray);
+        orderBook.orderClose{value: 1}(PAIR_INDEX_ETHER, USER_TRADE_INDEX_SECOND, updateDataArray);
+        orderBook.orderClose{value: 1}(PAIR_INDEX_ETHER, USER_TRADE_INDEX_THIRD, updateDataArray);
+
+        skip(1000);
+
+        orderBook.marketOrder{value: 1}(
+            PAIR_INDEX_ETHER, AMOUNT_COLLATERAL, LEVERAGE, ORDER_TYPE_LONG, pythUpdateDataArray
+        );
+        skip(1000);
+        orderBook.orderClose{value: 1}(PAIR_INDEX_ETHER, USER_TRADE_INDEX_FIRST, updateDataArray);
+
+        vm.stopPrank();
+    }
+
+    function testMarketOrdersAreCorrectlyStoredInMapping() public {
+        vm.startPrank(traderBigMoney);
+        ERC20Mock(usdc).approve(address(orderBook), MAX_INT);
+        orderBook.marketOrder{value: 1}(
+            PAIR_INDEX_ETHER, AMOUNT_COLLATERAL, LEVERAGE, ORDER_TYPE_LONG, pythUpdateDataArray
+        );
+        orderBook.marketOrder{value: 1}(
+            PAIR_INDEX_ETHER, AMOUNT_COLLATERAL, LEVERAGE, ORDER_TYPE_SHORT, pythUpdateDataArray
+        );
+        orderBook.marketOrder{value: 1}(
+            PAIR_INDEX_ETHER, AMOUNT_COLLATERAL, LEVERAGE, ORDER_TYPE_LONG, pythUpdateDataArray
+        );
+        OrderBook.PositionDetails memory userPositionDetailsFirstTrade =
+            orderBook.getUserTradingPositionDetails(address(traderBigMoney), PAIR_INDEX_ETHER, 1);
+        OrderBook.PositionDetails memory userPositionDetailsSecondTrade =
+            orderBook.getUserTradingPositionDetails(address(traderBigMoney), PAIR_INDEX_ETHER, 2);
+        OrderBook.PositionDetails memory userPositionDetailsThirdTrade =
+            orderBook.getUserTradingPositionDetails(address(traderBigMoney), PAIR_INDEX_ETHER, 3);
+
+        vm.stopPrank();
+    }
+
+    function testDifferentUsersCanOpenAndCloseTradesNormaly() public {
+        vm.startPrank(traderBigMoney);
+        ERC20Mock(usdc).approve(address(orderBook), MAX_INT);
+        orderBook.marketOrder{value: 1}(
+            PAIR_INDEX_ETHER, AMOUNT_COLLATERAL, LEVERAGE, ORDER_TYPE_LONG, pythUpdateDataArray
+        );
+        orderBook.marketOrder{value: 1}(
+            PAIR_INDEX_ETHER, AMOUNT_COLLATERAL, LEVERAGE, ORDER_TYPE_SHORT, pythUpdateDataArray
+        );
+        orderBook.marketOrder{value: 1}(
+            PAIR_INDEX_ETHER, AMOUNT_COLLATERAL, LEVERAGE, ORDER_TYPE_LONG, pythUpdateDataArray
+        );
+        OrderBook.PositionDetails memory userPositionDetailsFirstTrade =
+            orderBook.getUserTradingPositionDetails(address(traderBigMoney), PAIR_INDEX_ETHER, 1);
+        OrderBook.PositionDetails memory userPositionDetailsSecondTrade =
+            orderBook.getUserTradingPositionDetails(address(traderBigMoney), PAIR_INDEX_ETHER, 2);
+        OrderBook.PositionDetails memory userPositionDetailsThirdTrade =
+            orderBook.getUserTradingPositionDetails(address(traderBigMoney), PAIR_INDEX_ETHER, 3);
+
+        vm.stopPrank();
+        vm.startPrank(traderLoser);
+        orderBook.marketOrder{value: 1}(
+            PAIR_INDEX_ETHER, AMOUNT_COLLATERAL, LEVERAGE, ORDER_TYPE_LONG, pythUpdateDataArray
+        );
+        orderBook.marketOrder{value: 1}(
+            PAIR_INDEX_ETHER, AMOUNT_COLLATERAL, LEVERAGE, ORDER_TYPE_SHORT, pythUpdateDataArray
+        );
+        orderBook.marketOrder{value: 1}(
+            PAIR_INDEX_ETHER, AMOUNT_COLLATERAL, LEVERAGE, ORDER_TYPE_LONG, pythUpdateDataArray
+        );
+        vm.stopPrank();
+    }
+
+    ////////////////////
+    //getter functions//
+    ////////////////////
+    /// note if a user opens a trade and immediately calculates PNL (through getter or orderClose etc.) there will be a math error division by 0 since (openTime - currentTime) will result in 0
+    /// note currently there is no closing fee
+    function testGetUserLiquidationPrice() public {
+        vm.startPrank(traderBigMoney);
+        ERC20Mock(usdc).approve(address(orderBook), MAX_INT);
+        orderBook.marketOrder{value: 1}(
+            PAIR_INDEX_ETHER, AMOUNT_COLLATERAL, LEVERAGE, ORDER_TYPE_LONG, pythUpdateDataArray
+        );
+        skip(1000);
+        OrderBook.PositionDetails memory userPositionDetailsFirstTrade =
+            orderBook.getUserTradingPositionDetails(address(traderBigMoney), PAIR_INDEX_ETHER, 2);
+
+        orderBook.getUserLiquidationPrice(address(traderBigMoney), PAIR_INDEX_ETHER, 2);
     }
 }

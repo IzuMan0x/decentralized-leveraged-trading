@@ -7,6 +7,9 @@ import {console} from "forge-std/console.sol";
 import {Script} from "forge-std/Script.sol";
 //Paste the follwing into the command line to deploy the contract on a local testnet
 //forge script script/DeployOrderBook.s.sol:DeployOrderBook --rpc-url http://127.0.0.1:8545 --broadcast
+// cast nonce 0x70997970C51812dc3A010C7d01b50e0d17dc79C8 --rpc-url http://127.0.0.1:8545
+//sets the timestamp for the next block
+//cast rpc evm_setNextBlockTimestamp 3700000000000000000 --rpc-url http://127.0.0.1:8545
 
 contract HelperConfig is Script {
     NetworkConfig public activeNetworkConfig;
@@ -59,9 +62,10 @@ contract HelperConfig is Script {
 
         vm.startBroadcast(DEFAULT_ANVIL_PRIVATE_KEY);
 
-        // Creating a mock of Pyth contract with 60 seconds validTimePeriod (for staleness)
+        // Creating a mock of Pyth contract with 10hrs validTimePeriod (for staleness)
         // and 1 wei fee for updating the price.
-        MockPyth mockPyth = new MockPyth(60, 1);
+        // for test purposes we not care about staleness
+        MockPyth mockPyth = new MockPyth(2e50, 1);
 
         bytes[] memory updateDataArray = new bytes[](2);
         bytes memory updateData;
