@@ -100,20 +100,16 @@ contract OrderBook is ReentrancyGuard, Ownable {
     int256 private constant SECONDS_IN_HOUR = 3600;
 
     //accepted collateral address for making trades, should be a stable coin like Dai or USDC etc.
+    //These can all be changed by the owner
     address private s_tokenCollateralAddress;
+    int256 private s_openingFeePercentage = 7500; //0.075% 75000
+    int256 private s_baseBorrowFeePercentage = 600;
+    int256 private s_baseVariableBorrowFeePercentage = 100;
+    int256 private s_maxBorrowInterestRate = 100 * 100;
+    int256 private s_minTradeSize = 1500 ether;
+    uint256 private s_botExecutionRewardRate = 2 ether;
 
-    //The fees are based on the total position size
-    //The following parameters may need to be modifiable
-    //int256 private constant OPENING_FEE_PERCENTAGE = 7500; //0.075% or 75000
-    int256 private s_openingFeePercentage = 7500;
-    int256 private constant CLOSING_FEE_PERCENTAGE = 7500; //0.075% 75000
-    int256 private BASE_BORROW_FEE_PERCENTAGE = 600; // 0.01%/h or
-    int256 private BASE_VAR_BORROW_FEE_PERCENTAGE = 100;
-    int256 private constant ROLLOVER_FEE = 10000; //0.1% this will be charged every hour on the collateral size currently not being used
-    int256 private constant MAX_BORROW_INTEREST_RATE = 100 * 100; //First number should be the BASE_BORROW_FEE_PERCENTAGE and the second numbner is the multiplier e.g.
-    int256 private constant MIN_TRADE_SIZE = 1500 ether; //This will be affected by the network costs because ** Fee > (Gas cost for opening and closing a trade) **
-    //this should be determined by the gas cost and possibly the size of the trade
-    uint256 private constant BOT_EXECUTION_REWARDS = 2 ether;
+    //int256 private constant ROLLOVER_FEE = 10000; //0.1% this will be charged every hour on the collateral size currently not being used
 
     uint256 private s_numberOfAvailableAssetPairs; // we will use this to loop through the mappings and get the pair details
 
@@ -144,6 +140,10 @@ contract OrderBook is ReentrancyGuard, Ownable {
     event UserLiquidationDetails(address indexed userAddress, uint256 indexed pairIndex, int256 indexed userPNL);
     event OrderClosedTradeDetails(address indexed userAddress, uint256 indexed pairIndex, int256 indexed userPNL);
     event OpeningFeeChanged(address user, int256 newOpeningFee);
+    event BaseBorrowFeeChanged(address indexed user, int256 indexed newBaseBorrowFeePercentage);
+    event BaseVariableBorrowFeeChanged(address indexed user, int256 indexed newVariableBorrowFeePercentage);
+    event MaxBorrowRateChanged(address indexed user, int256 indexed newMaxBorrowInterestRate);
+    event MinTradeSizeChanged(address indexed user, int256 indexed newMinTradeSize);
     //Following events are used for testing purposes
     event AvgBorrowFeeCalculation(uint256 indexed pairIndex, int256 indexed borrowFee, uint256 indexed orderType);
     event BorrowFeeUpdated(uint256 indexed pairIndex, int256[] borrowFees);
@@ -161,7 +161,7 @@ contract OrderBook is ReentrancyGuard, Ownable {
             revert OrderBook__InvalidOrderType();
         } else if (amount == 0 || leverage == 0) {
             revert OrderBook__NeedsMoreThanZero();
-        } else if (((amount * leverage) / LEVERAGE_PRECISION) < MIN_TRADE_SIZE) {
+        } else if (((amount * leverage) / LEVERAGE_PRECISION) < s_minTradeSize) {
             revert OrderBook__TradeSizeTooSmall();
         } else if (
             orderType == 0
@@ -263,6 +263,40 @@ contract OrderBook is ReentrancyGuard, Ownable {
     function setOpeningFee(int256 newOpeningFeePercent) external onlyOwner {
         s_openingFeePercentage = newOpeningFeePercent;
         emit OpeningFeeChanged(msg.sender, s_openingFeePercentage);
+    }
+
+    function setBaseBorrowFeePercentage(int256 newBaseBorrowFeePercentage) external onlyOwner {
+        s_baseBorrowFeePercentage = newBaseBorrowFeePercentage;
+        emit BaseBorrowFeeChanged(msg.sender, s_baseBorrowFeePercentage);
+    }
+
+    function setVariableBorrowFeePercentage(int256 newVariableBorrowFeePercentage) external onlyOwner {
+        s_baseVariableBorrowFeePercentage = newVariableBorrowFeePercentage;
+        emit BaseVariableBorrowFeeChanged(msg.sender, s_baseVariableBorrowFeePercentage);
+    }
+
+    function setMaxBorrowInterestRate(int256 newMaxBorrowInterestRate) external onlyOwner {
+        s_maxBorrowInterestRate = newMaxBorrowInterestRate;
+        emit MaxBorrowRateChanged(msg.sender, s_maxBorrowInterestRate);
+    }
+
+    function setMinTradeSize(int256 newMinTradeSize) external onlyOwner {
+        s_minTradeSize = newMinTradeSize;
+        emit MinTradeSizeChanged(msg.sender, s_minTradeSize);
+    }
+
+    function withdrawEth(address payable _to) external payable onlyOwner {
+        (bool sent, bytes memory data) = _to.call{value: address(this).balance}("");
+        if (!sent) {
+            revert OrderBook__TransferFailed();
+        }
+    }
+
+    function withdrawErc20Token(address tokenAddress, uint256 amount) external onlyOwner {
+        bool success = IERC20(tokenAddress).transferFrom(address(this), msg.sender, amount);
+        if (!success) {
+            revert OrderBook__TransferFailed();
+        }
     }
 
     /// @notice Immediately opens a trading position based on the current market price for an trading pair
@@ -399,7 +433,7 @@ contract OrderBook is ReentrancyGuard, Ownable {
 
             s_userOpenTrades[user][pairIndex][userTradesIdForPair] = 0;
             s_userOpenTrades[user][userPositionDetails.pairNumber][userTradesIdForPair] = 0;
-            s_botExecutionRewards[msg.sender] += BOT_EXECUTION_REWARDS;
+            s_botExecutionRewards[msg.sender] += s_botExecutionRewardRate;
             emit UserLiquidated(user, userPositionDetails.pairNumber, userTradesIdForPair);
             emit UserLiquidationDetails(user, userPositionDetails.pairNumber, userPNL);
         } else {
@@ -565,18 +599,18 @@ contract OrderBook is ReentrancyGuard, Ownable {
             delete s_assetPairDetails[pairIndex].time;
             delete s_assetPairDetails[pairIndex].borrowFee;
         } else if (s_assetPairDetails[pairIndex].assetTotalLongs == 0) {
-            borrowFee = -1 * MAX_BORROW_INTEREST_RATE * (s_assetPairDetails[pairIndex].assetTotalShorts)
+            borrowFee = -1 * s_maxBorrowInterestRate * (s_assetPairDetails[pairIndex].assetTotalShorts)
                 / s_assetPairDetails[pairIndex].maxOpenInterest;
         } else if (s_assetPairDetails[pairIndex].assetTotalShorts == 0) {
-            borrowFee = MAX_BORROW_INTEREST_RATE * s_assetPairDetails[pairIndex].assetTotalLongs
+            borrowFee = s_maxBorrowInterestRate * s_assetPairDetails[pairIndex].assetTotalLongs
                 / s_assetPairDetails[pairIndex].maxOpenInterest;
         } else if ((s_assetPairDetails[pairIndex].assetTotalLongs / s_assetPairDetails[pairIndex].assetTotalShorts) > 1)
         {
-            borrowFee = BASE_VAR_BORROW_FEE_PERCENTAGE * s_assetPairDetails[pairIndex].assetTotalLongs
+            borrowFee = s_baseVariableBorrowFeePercentage * s_assetPairDetails[pairIndex].assetTotalLongs
                 / s_assetPairDetails[pairIndex].assetTotalShorts;
         } else if ((s_assetPairDetails[pairIndex].assetTotalLongs / s_assetPairDetails[pairIndex].assetTotalShorts) < 1)
         {
-            borrowFee = -1 * BASE_VAR_BORROW_FEE_PERCENTAGE * s_assetPairDetails[pairIndex].assetTotalShorts
+            borrowFee = -1 * s_baseVariableBorrowFeePercentage * s_assetPairDetails[pairIndex].assetTotalShorts
                 / s_assetPairDetails[pairIndex].assetTotalLongs;
         } else if (s_assetPairDetails[pairIndex].assetTotalLongs == s_assetPairDetails[pairIndex].assetTotalShorts) {
             borrowFee = 0;
@@ -660,12 +694,12 @@ contract OrderBook is ReentrancyGuard, Ownable {
         int256 borrowFee;
 
         if (orderType == 0) {
-            borrowFee = BASE_BORROW_FEE_PERCENTAGE + avgBorrowFee;
+            borrowFee = s_baseBorrowFeePercentage + avgBorrowFee;
             //emit AvgBorrowFeeCalculation(pairIndex, borrowFee, orderType);
             return borrowFee;
         }
         if (orderType == 1) {
-            borrowFee = BASE_BORROW_FEE_PERCENTAGE - avgBorrowFee;
+            borrowFee = s_baseBorrowFeePercentage - avgBorrowFee;
             //emit AvgBorrowFeeCalculation(pairIndex, borrowFee, orderType);
             return borrowFee;
         }
