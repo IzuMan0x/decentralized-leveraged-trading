@@ -64,7 +64,7 @@ contract HelperConfig is Script {
 
         // Creating a mock of Pyth contract with 10hrs validTimePeriod (for staleness)
         // and 1 wei fee for updating the price.
-        // for test purposes we not care about staleness
+        // for test purposes we not care about staleness thus 2e50😜
         MockPyth mockPyth = new MockPyth(2e50, 1);
 
         bytes[] memory updateDataArray = new bytes[](2);

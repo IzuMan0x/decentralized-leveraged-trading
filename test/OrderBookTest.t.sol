@@ -170,6 +170,28 @@ contract OrderBookTest is Test {
         vm.stopPrank();
     }
 
+    function testSimpleOpenAndCloseATrade() public {
+        vm.startPrank(traderBigMoney);
+        ERC20Mock(usdc).approve(address(orderBook), MAX_INT);
+        orderBook.marketOrder{value: 1}(
+            PAIR_INDEX_ETHER, AMOUNT_COLLATERAL, LEVERAGE, ORDER_TYPE_LONG, pythUpdateDataArray
+        );
+        orderBook.marketOrder{value: 1}(
+            PAIR_INDEX_ETHER, AMOUNT_COLLATERAL, LEVERAGE, ORDER_TYPE_SHORT, pythUpdateDataArray
+        );
+        skip(13 days);
+
+        (int256 userPNL, int256 borrowFee) =
+            orderBook.getUserLiquidationPrice(address(traderBigMoney), PAIR_INDEX_ETHER, USER_TRADE_INDEX_FIRST);
+        console.log("user PNL and borrow fee for long is: ", uint256(userPNL), uint256(borrowFee));
+        (int256 userPNLShort, int256 borrowFeeShort) =
+            orderBook.getUserLiquidationPrice(address(traderBigMoney), PAIR_INDEX_ETHER, USER_TRADE_INDEX_SECOND);
+        console.log("user PNL and borrow fee short is: ", uint256(userPNLShort), uint256(borrowFeeShort));
+
+        orderBook.orderClose{value: 1}(PAIR_INDEX_ETHER, USER_TRADE_INDEX_FIRST, pythUpdateDataArray);
+        vm.stopPrank();
+    }
+
     function testOnlyThreeOpenTradesPerPair() public {
         //traderBigMoney is opening his winning trade😜
         vm.startPrank(traderBigMoney);

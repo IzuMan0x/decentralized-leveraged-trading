@@ -103,21 +103,19 @@ contract OrderBook is ReentrancyGuard, Ownable {
     address private s_tokenCollateralAddress;
 
     //The fees are based on the total position size
-    //we are going to make these constants, previously they were placed in the constructor
-    int256 private constant OPENING_FEE_PERCENTAGE = 7500; //0.075% or 75000
+    //The following parameters may need to be modifiable
+    //int256 private constant OPENING_FEE_PERCENTAGE = 7500; //0.075% or 75000
+    int256 private s_openingFeePercentage = 7500;
     int256 private constant CLOSING_FEE_PERCENTAGE = 7500; //0.075% 75000
     int256 private BASE_BORROW_FEE_PERCENTAGE = 600; // 0.01%/h or
     int256 private BASE_VAR_BORROW_FEE_PERCENTAGE = 100;
     int256 private constant ROLLOVER_FEE = 10000; //0.1% this will be charged every hour on the collateral size currently not being used
     int256 private constant MAX_BORROW_INTEREST_RATE = 100 * 100; //First number should be the BASE_BORROW_FEE_PERCENTAGE and the second numbner is the multiplier e.g.
     int256 private constant MIN_TRADE_SIZE = 1500 ether; //This will be affected by the network costs because ** Fee > (Gas cost for opening and closing a trade) **
-
     //this should be determined by the gas cost and possibly the size of the trade
     uint256 private constant BOT_EXECUTION_REWARDS = 2 ether;
-    //number of asset pairs currently available on the contract
-    //we will use this iterate through the mapping retreive all the asset pairs <---really? we need to see if this variable is useful
-    //This will be set in the constructor should be updateable
-    uint256 private s_numberOfAvailableAssetPairs;
+
+    uint256 private s_numberOfAvailableAssetPairs; // we will use this to loop through the mappings and get the pair details
 
     //Maybe change the mappings a bit and create an order struct in another contract
     mapping(uint256 assetPairIndex => AssetPairDetails assetPairDetails) private s_assetPairDetails;
@@ -129,8 +127,6 @@ contract OrderBook is ReentrancyGuard, Ownable {
             )
     ) private s_userTradeDetails;
 
-    //This may be unnecessary
-    // changing this to an array with 3 slots
     // each slot will have either 0 or 1, 0 will be default and mean the trade slot is open and 1 will mean the trade slot is filled
     // to determine if the trade limit we will add get the sum of the array
     // in the future we may change these to enums for clarity and security reasons... however 1's and 0's are more clear to me
@@ -140,11 +136,14 @@ contract OrderBook is ReentrancyGuard, Ownable {
     ////////////////////
     // Events         //
     ///////////////////
-    event OrderClosed(address indexed user, uint256 indexed pairIndex, int256 indexed userPNL);
+    event OrderClosed(address indexed user, uint256 indexed pairIndex, uint256 userTradeIndex);
     event MarketTrade(address indexed user, uint256 indexed pairIndex);
-    event UserLiquidated(address indexed user, uint256 pairIndex, int256 userPNL);
+    event UserLiquidated(address indexed user, uint256 pairIndex, uint256 userTradeIndex);
     event TradeOpened(address indexed user, uint256 indexed pairIndex, uint256 indexed userPairTradeIndex);
     event OpenInterestUpdated(int256 interestLongs, int256 interestShorts);
+    event UserLiquidationDetails(address indexed userAddress, uint256 indexed pairIndex, int256 indexed userPNL);
+    event OrderClosedTradeDetails(address indexed userAddress, uint256 indexed pairIndex, int256 indexed userPNL);
+    event OpeningFeeChanged(address user, int256 newOpeningFee);
     //Following events are used for testing purposes
     event AvgBorrowFeeCalculation(uint256 indexed pairIndex, int256 indexed borrowFee, uint256 indexed orderType);
     event BorrowFeeUpdated(uint256 indexed pairIndex, int256[] borrowFees);
@@ -261,6 +260,11 @@ contract OrderBook is ReentrancyGuard, Ownable {
         }
     }
 
+    function setOpeningFee(int256 newOpeningFeePercent) external onlyOwner {
+        s_openingFeePercentage = newOpeningFeePercent;
+        emit OpeningFeeChanged(msg.sender, s_openingFeePercentage);
+    }
+
     /// @notice Immediately opens a trading position based on the current market price for an trading pair
     /// @dev bytes[] calldata priceUpdateData is retrieved from the pyth frontend API, check the docs for more details (https://docs.pyth.network/documentation/pythnet-price-feeds/price-service)
     /// @dev Always update the pyth price feed manually before getting a price ^^
@@ -328,6 +332,8 @@ contract OrderBook is ReentrancyGuard, Ownable {
         PositionDetails memory userPositionDetails = s_userTradeDetails[msg.sender][pairIndex][userTradesIdForPair];
 
         int256 userPNL = _getUserPNL(msg.sender, userPositionDetails, userTradesIdForPair, priceUpdateData);
+        //here we are charging an OpenFee/ClosingFee currently they cost the same
+        userPNL = userPNL - _calculateOpenFee(userPositionDetails.collateralAfterFee, userPositionDetails.leverage);
 
         // Here for possible gas optimization
         //s_userOpenTrades[msg.sender][userPositionDetails.pairNumber][userTradesIdForPair] = 0;
@@ -336,7 +342,7 @@ contract OrderBook is ReentrancyGuard, Ownable {
         //setting the trade slot to zero which means it is now open
         s_userOpenTrades[msg.sender][pairIndex][userTradesIdForPair] = 0;
 
-        //The following steps should be put into one function
+        //The following steps should be put into one function, since the arrays need to be kept nsync ☢
         //---------------------------------------------
         //updating the borrow array
         _updatePairTotalBorrowed(
@@ -346,20 +352,21 @@ contract OrderBook is ReentrancyGuard, Ownable {
             false
         );
 
-        //updating the borrow fee rate... this porbable should be called within the the _updatePairTotalBorrowed
-        //This must be set before _setBorrowFeeArray because it may be deleted and as a result they will be out of sync
+        //updating the borrow fee rate... this should be called within the the _updatePairTotalBorrowed
+        //Time array must be set before _setBorrowFeeArray because it may be deleted and as a result they will be out of sync
         s_assetPairDetails[pairIndex].time.push(block.timestamp);
         _setBorrowFeeArray(pairIndex);
 
         //---------------------------------------------
 
-        //checking PNL and paying out winnings or losses. If PNL is less than zero the user lose their collateral
+        //checking PNL and paying out winnings or losses. If PNL is less than zero the user loses their collateral
         if (userPNL >= 0) {
             uint256 uintUserPNL = uint256(userPNL);
             _sendFunds(msg.sender, uintUserPNL);
         }
 
-        emit OrderClosed(msg.sender, userPositionDetails.pairNumber, userPNL);
+        emit OrderClosed(msg.sender, userPositionDetails.pairNumber, userTradesIdForPair);
+        emit OrderClosedTradeDetails(msg.sender, userPositionDetails.pairNumber, userPNL);
     }
 
     /// @notice liquidates a user if there PNL is at zero or below
@@ -377,15 +384,14 @@ contract OrderBook is ReentrancyGuard, Ownable {
     ) public payable userPositionExist(user, pairIndex, userTradesIdForPair) nonReentrant {
         PositionDetails memory userPositionDetails = s_userTradeDetails[user][pairIndex][userTradesIdForPair];
 
-        //change from msg.sender to user please test
         int256 userPNL = _getUserPNL(user, userPositionDetails, userTradesIdForPair, priceUpdateData);
 
         if (userPNL <= 0) {
             delete s_userTradeDetails[user][userPositionDetails.pairNumber][userTradesIdForPair];
             _updatePairTotalBorrowed(
-                positionDetails.orderType,
-                positionDetails.pairIndex,
-                positionDetails.collateralAfterFee * positionDetails.leverage / LEVERAGE_PRECISION,
+                userPositionDetails.longShort,
+                userPositionDetails.pairNumber,
+                userPositionDetails.collateralAfterFee * userPositionDetails.leverage / LEVERAGE_PRECISION,
                 false
             );
             s_assetPairDetails[pairIndex].time.push(block.timestamp);
@@ -394,7 +400,8 @@ contract OrderBook is ReentrancyGuard, Ownable {
             s_userOpenTrades[user][pairIndex][userTradesIdForPair] = 0;
             s_userOpenTrades[user][userPositionDetails.pairNumber][userTradesIdForPair] = 0;
             s_botExecutionRewards[msg.sender] += BOT_EXECUTION_REWARDS;
-            emit UserLiquidated(user, userPositionDetails.pairNumber, userPNL);
+            emit UserLiquidated(user, userPositionDetails.pairNumber, userTradesIdForPair);
+            emit UserLiquidationDetails(user, userPositionDetails.pairNumber, userPNL);
         } else {
             revert OrderBook__UserPositionNotOpenForLiquidation(userPNL);
         }
@@ -460,29 +467,6 @@ contract OrderBook is ReentrancyGuard, Ownable {
         /* userPNL =
             userPNL - int256(_calculateOpenFee(userPositionDetails.collateralAfterFee, userPositionDetails.leverage)); */
         return userPNL;
-
-        //old cold
-
-        /* PositionDetails memory positionDetails = s_userTradeDetails[user][assetPairIndex][openTradeIdForPair];
-
-        int256 borrowFeePercentage = _calculateBorrowFee(user, assetPairIndex, openTradeIdForPair);
-
-        //This needs to be checked
-        //divided by 1e16 to get an amount with 5 decimals
-        int256 borrowFeeAmount = borrowFeePercentage * int256(block.timestamp - positionDetails.openTime)
-            * int256(positionDetails.collateralAfterFee * positionDetails.leverage / LEVERAGE_PRECISION)
-            / int256(SECONDS_IN_HOUR) / 1e16;
-
-        if (positionDetails.longShort == 0) {
-            liquidationPrice = int256(positionDetails.leverage - LEVERAGE_PRECISION)
-                * int256(uint256((positionDetails.openPrice))) / int256(positionDetails.leverage) + int256(borrowFeeAmount);
-            return (liquidationPrice, borrowFeeAmount);
-        }
-
-        if (positionDetails.longShort == 1) {
-            liquidationPrice = int256(positionDetails.leverage + LEVERAGE_PRECISION)
-                * int256(uint256((positionDetails.openPrice))) / int256(positionDetails.leverage) - int256(borrowFeeAmount);
-            return (liquidationPrice, borrowFeeAmount); */
     }
 
     function _updatePairTotalBorrowed(uint256 orderType, uint256 pairIndex, int256 positionSize, bool openingTradeBool)
@@ -537,7 +521,6 @@ contract OrderBook is ReentrancyGuard, Ownable {
         uint256 orderType,
         bytes[] calldata priceUpdateData
     ) private {
-        //Watchout for math overflow
         //Here we are getting the openFee and subtracting it from the collateral
         //collateral after fee has a precision 1e18
         int256 collateralAfterFee;
@@ -598,50 +581,6 @@ contract OrderBook is ReentrancyGuard, Ownable {
         } else if (s_assetPairDetails[pairIndex].assetTotalLongs == s_assetPairDetails[pairIndex].assetTotalShorts) {
             borrowFee = 0;
         }
-
-        //below is old code
-        // I must have been smoking something 💨🤤
-        /* 
-        if (s_assetPairDetails[pairIndex].assetTotalLongs == 0) {
-            //s_assetPairDetails[pairIndex].assetTotalShorts
-            //need to check how big the shorts are then set the appropriate borrow rate
-            //1e18 precision for the maxOpenInterest and 1e7 precision for MAX_BORROW_RATE
-            //2 * BASE_BORROW_FEE_PERCENTAGE * (COLLATERAL_PRECISION / FEE_PRECISION) -
-            borrowFee = -(
-                s_assetPairDetails[pairIndex].assetTotalShorts * COLLATERAL_PRECISION
-                    / s_assetPairDetails[pairIndex].maxOpenInterest
-            ) * MAX_BORROW_INTEREST_RATE / FEE_PRECISION;
-            borrowFee = borrowFee / (COLLATERAL_PRECISION / FEE_PRECISION);
-        } else if (s_assetPairDetails[pairIndex].assetTotalShorts == 0) {
-            //s_assetPairDetails[pairIndex].assetTotalShorts
-            //need to check how big the longs are then set the appropriate borrow rate
-            //1e18 precision for the maxOpenInterest and 1e7 precision for MAX_BORROW_RATE
-            // 2 * (BASE_BORROW_FEE_PERCENTAGE) * (COLLATERAL_PRECISION / FEE_PRECISION) +
-
-            borrowFee = (
-                s_assetPairDetails[pairIndex].assetTotalLongs * COLLATERAL_PRECISION
-                    / s_assetPairDetails[pairIndex].maxOpenInterest
-            ) * MAX_BORROW_INTEREST_RATE / FEE_PRECISION;
-            borrowFee = borrowFee / (COLLATERAL_PRECISION / FEE_PRECISION);
-        } else if ((s_assetPairDetails[pairIndex].assetTotalLongs / s_assetPairDetails[pairIndex].assetTotalShorts) < 1)
-        {
-            //int256(BASE_BORROW_FEE_PERCENTAGE) +
-            borrowFee = -(BASE_BORROW_FEE_PERCENTAGE)
-                * int256(
-                    COLLATERAL_PRECISION
-                        - s_assetPairDetails[pairIndex].assetTotalShorts * COLLATERAL_PRECISION
-                            / s_assetPairDetails[pairIndex].assetTotalLongs
-                ) / (COLLATERAL_PRECISION / FEE_PRECISION);
-        }
-        //(longShortRatio >= 1)
-        else {
-            int256 longShortRatio = s_assetPairDetails[pairIndex].assetTotalLongs * COLLATERAL_PRECISION
-                / s_assetPairDetails[pairIndex].assetTotalShorts;
-            // int256(BASE_BORROW_FEE_PERCENTAGE) +
-            borrowFee =
-                BASE_BORROW_FEE_PERCENTAGE * int256(COLLATERAL_PRECISION - longShortRatio) / (COLLATERAL_PRECISION);
-        } */
-
         s_assetPairDetails[pairIndex].borrowFee.push(borrowFee);
 
         emit BorrowFeeUpdated(pairIndex, s_assetPairDetails[pairIndex].borrowFee);
@@ -666,10 +605,11 @@ contract OrderBook is ReentrancyGuard, Ownable {
         return adjustedPrice;
     }
 
-    function _calculateOpenFee(int256 amountCollateral, int256 leverage) private pure returns (int256 openFee) {
+    function _calculateOpenFee(int256 amountCollateral, int256 leverage) private view returns (int256 openFee) {
         int256 positionSize = (amountCollateral * leverage) / LEVERAGE_PRECISION;
         //this will return openFee which will have a precision 1e18
-        openFee = (positionSize * OPENING_FEE_PERCENTAGE) / FEE_PRECISION;
+        openFee = (positionSize * s_openingFeePercentage) / FEE_PRECISION;
+        //openFee = (positionSize * OPENING_FEE_PERCENTAGE) / FEE_PRECISION;
     }
 
     //events for debugging
@@ -681,6 +621,7 @@ contract OrderBook is ReentrancyGuard, Ownable {
     //We want this to be dynamic and change as the amount of long and shorts change
     function _calculateBorrowFee(address user, uint256 pairIndex, uint256 orderType, uint256 openTradesIdForPair)
         private
+        view
         returns (int256)
     {
         //For some reason when calling this function from liquidateUser the orderType was being reset to zero in the positionDetails struct....... so now we just send everything individually
@@ -689,8 +630,8 @@ contract OrderBook is ReentrancyGuard, Ownable {
         //the follwing will be 1 for the first trade, which may be confusing, not really the start index since we start at zero
         uint256 startIndex = s_userTradeDetails[user][pairIndex][openTradesIdForPair].indexBorrowPercentArray;
 
-        emit StartIndex(startIndex);
-        emit TimeArrayLength(timeArrayLength);
+        /* emit StartIndex(startIndex);
+        emit TimeArrayLength(timeArrayLength); */
 
         int256 sum;
         for (uint256 i = startIndex; i < (s_assetPairDetails[pairIndex].time.length - 1); i++) {
@@ -699,7 +640,7 @@ contract OrderBook is ReentrancyGuard, Ownable {
                     * int256(s_assetPairDetails[pairIndex].time[i + 1] - s_assetPairDetails[pairIndex].time[i]);
         }
         /// (SECONDS_IN_HOUR * TIME_PRECISION);
-        emit Sum(sum);
+        //emit Sum(sum);
 
         //we need to get the last sum which will be based off the current block time
         //The following code causes an array out of index error
@@ -710,37 +651,22 @@ contract OrderBook is ReentrancyGuard, Ownable {
                 * int256(block.timestamp - s_assetPairDetails[pairIndex].time[timeArrayLength - 1]);
         //***************************** */
 
-        // fixed it please test it now
         int256 avgBorrowFee = sum
             / (
                 int256(s_assetPairDetails[pairIndex].time.length - startIndex)
                     * int256(block.timestamp - s_assetPairDetails[pairIndex].time[startIndex])
             );
 
-        //This needs to be checked especially when dealing with different types
-        //For longs
-        //We could simplify this more but for now it will work
-        //May no longer be need after changing from storing the ratio to storing the percentage
-        /*  if (orderType == 0) {
-            return borrowFee =
-                int256(BASE_BORROW_FEE_PERCENTAGE - BASE_BORROW_FEE_PERCENTAGE * (avgBorrowRatio - 1) / avgBorrowRatio);
-        }
-
-        //For shorts
-        if (orderType == 1) {
-            return borrowFee = int256(BASE_BORROW_FEE_PERCENTAGE + BASE_BORROW_FEE_PERCENTAGE * (1 - avgBorrowRatio));
-        } */
-
         int256 borrowFee;
 
         if (orderType == 0) {
             borrowFee = BASE_BORROW_FEE_PERCENTAGE + avgBorrowFee;
-            emit AvgBorrowFeeCalculation(pairIndex, borrowFee, orderType);
+            //emit AvgBorrowFeeCalculation(pairIndex, borrowFee, orderType);
             return borrowFee;
         }
         if (orderType == 1) {
             borrowFee = BASE_BORROW_FEE_PERCENTAGE - avgBorrowFee;
-            emit AvgBorrowFeeCalculation(pairIndex, borrowFee, orderType);
+            //emit AvgBorrowFeeCalculation(pairIndex, borrowFee, orderType);
             return borrowFee;
         }
 
@@ -782,10 +708,9 @@ contract OrderBook is ReentrancyGuard, Ownable {
         return s_userOpenTrades[user][pairIndex];
     }
 
-    //Fixed 9/1/2023
-    /// note function should be changed to view after testing and removing excessive event emitting
     function getUserLiquidationPrice(address user, uint256 assetPairIndex, uint256 openTradesIdForPair)
         external
+        view
         userPositionExist(user, assetPairIndex, openTradesIdForPair)
         returns (int256 liquidationPrice, int256 borrowFeeAmount)
     {
@@ -794,21 +719,21 @@ contract OrderBook is ReentrancyGuard, Ownable {
         int256 borrowFeePercentage =
             _calculateBorrowFee(user, assetPairIndex, positionDetails.longShort, openTradesIdForPair);
 
-        //This needs to be checked
-        //divided by 1e16 to get an amount with 5 decimals
         borrowFeeAmount = borrowFeePercentage * int256(block.timestamp - positionDetails.openTime)
             * int256(positionDetails.collateralAfterFee * positionDetails.leverage)
             / (LEVERAGE_PRECISION * FEE_PRECISION * SECONDS_IN_HOUR);
-        // liquidation price is 1e18
+        // liquidation price precision is 1e18
         if (positionDetails.longShort == 0) {
             liquidationPrice = LEVERAGE_PRECISION * positionDetails.openPrice / positionDetails.leverage
-                * (positionDetails.leverage - LEVERAGE_PRECISION) * 1e7 + borrowFeeAmount;
+                * (positionDetails.leverage - LEVERAGE_PRECISION) * 1e7
+                + (borrowFeeAmount * LEVERAGE_PRECISION) / positionDetails.leverage;
             return (liquidationPrice, borrowFeeAmount);
         }
 
         if (positionDetails.longShort == 1) {
-            liquidationPrice = liquidationPrice = LEVERAGE_PRECISION * positionDetails.openPrice
-                / positionDetails.leverage * (positionDetails.leverage + LEVERAGE_PRECISION) * 1e7 - borrowFeeAmount;
+            liquidationPrice = LEVERAGE_PRECISION * positionDetails.openPrice / positionDetails.leverage
+                * (positionDetails.leverage + LEVERAGE_PRECISION) * 1e7
+                - (borrowFeeAmount * LEVERAGE_PRECISION) / positionDetails.leverage;
             return (liquidationPrice, borrowFeeAmount);
         }
     }
