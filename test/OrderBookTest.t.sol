@@ -29,6 +29,7 @@ contract OrderBookTest is Test {
     uint8 private constant ORDER_TYPE_SHORT = 1;
 
     bytes32 constant ETH_PRICE_ID = 0x000000000000000000000000000000000000000000000000000000000000abcd;
+    bytes32 constant BTC_PRICE_ID = 0x0000000000000000000000000000000000000000000000000000000000001234;
 
     //user trade index
     uint256 private constant USER_TRADE_INDEX_FIRST = 2;
@@ -181,6 +182,10 @@ contract OrderBookTest is Test {
         );
         skip(13 days);
 
+        orderBook.getAllUserOpenTrades(address(traderBigMoney));
+
+        skip(1 days);
+
         (int256 userPNL, int256 borrowFee) =
             orderBook.getUserLiquidationPrice(address(traderBigMoney), PAIR_INDEX_ETHER, USER_TRADE_INDEX_FIRST);
         console.log("user PNL and borrow fee for long is: ", uint256(userPNL), uint256(borrowFee));
@@ -189,6 +194,37 @@ contract OrderBookTest is Test {
         console.log("user PNL and borrow fee short is: ", uint256(userPNLShort), uint256(borrowFeeShort));
 
         orderBook.orderClose{value: 1}(PAIR_INDEX_ETHER, USER_TRADE_INDEX_FIRST, pythUpdateDataArray);
+        vm.stopPrank();
+    }
+
+    function testOpeningMaxTradesEveryPair() public {
+        vm.startPrank(traderBigMoney);
+        ERC20Mock(usdc).approve(address(orderBook), MAX_INT);
+        int64 btcPrice = 2000;
+        bytes[] memory updateDataArrayBtc = new bytes[](1);
+        updateDataArrayBtc[0] = MockPyth(pythPriceFeedAddress).createPriceFeedUpdateData(
+            BTC_PRICE_ID, btcPrice * 100000, 10 * 100000, -5, btcPrice * 100000, 10 * 100000, uint64(block.timestamp)
+        );
+        orderBook.marketOrder{value: 1}(
+            PAIR_INDEX_ETHER, AMOUNT_COLLATERAL, LEVERAGE, ORDER_TYPE_LONG, pythUpdateDataArray
+        );
+        orderBook.marketOrder{value: 1}(
+            PAIR_INDEX_ETHER, AMOUNT_COLLATERAL, LEVERAGE, ORDER_TYPE_SHORT, pythUpdateDataArray
+        );
+        orderBook.marketOrder{value: 1}(
+            PAIR_INDEX_ETHER, AMOUNT_COLLATERAL, LEVERAGE, ORDER_TYPE_LONG, pythUpdateDataArray
+        );
+        orderBook.marketOrder{value: 1}(
+            PAIR_INDEX_BTC, AMOUNT_COLLATERAL + 100 ether, LEVERAGE, ORDER_TYPE_LONG, updateDataArrayBtc
+        );
+        orderBook.marketOrder{value: 1}(
+            PAIR_INDEX_BTC, AMOUNT_COLLATERAL + 200 ether, LEVERAGE, ORDER_TYPE_SHORT, updateDataArrayBtc
+        );
+        orderBook.marketOrder{value: 1}(
+            PAIR_INDEX_BTC, AMOUNT_COLLATERAL + 300 ether, LEVERAGE, ORDER_TYPE_LONG, updateDataArrayBtc
+        );
+        skip(1000);
+        orderBook.getAllUserOpenTrades(address(traderBigMoney));
         vm.stopPrank();
     }
 

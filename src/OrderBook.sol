@@ -61,6 +61,7 @@ contract OrderBook is ReentrancyGuard, Ownable {
     error OrderBook__MaxOpenInterestReachedLongs();
     error OrderBook__MaxOpenInterestShortsReached();
     error OrderBook__UserPositionNotOpenForLiquidation(int256 userPNL);
+    error OrderBook__NoBotRewards();
 
     ////////////////////
     // State Variables //
@@ -144,6 +145,7 @@ contract OrderBook is ReentrancyGuard, Ownable {
     event BaseVariableBorrowFeeChanged(address indexed user, int256 indexed newVariableBorrowFeePercentage);
     event MaxBorrowRateChanged(address indexed user, int256 indexed newMaxBorrowInterestRate);
     event MinTradeSizeChanged(address indexed user, int256 indexed newMinTradeSize);
+    event BotRewardsClaimed(address indexed botAddress, uint256 indexed amount);
     //Following events are used for testing purposes
     event AvgBorrowFeeCalculation(uint256 indexed pairIndex, int256 indexed borrowFee, uint256 indexed orderType);
     event BorrowFeeUpdated(uint256 indexed pairIndex, int256[] borrowFees);
@@ -215,6 +217,13 @@ contract OrderBook is ReentrancyGuard, Ownable {
     modifier validOrderType(uint256 orderType) {
         if (orderType != 0 && orderType != 1) {
             revert OrderBook__InvalidOrderType();
+        }
+        _;
+    }
+
+    modifier rewardAmount(address user) {
+        if (s_botExecutionRewards[user] == 0) {
+            revert OrderBook__NoBotRewards();
         }
         _;
     }
@@ -297,6 +306,17 @@ contract OrderBook is ReentrancyGuard, Ownable {
         if (!success) {
             revert OrderBook__TransferFailed();
         }
+    }
+
+    function withdrawBotRewards() external rewardAmount(msg.sender) nonReentrant {
+        uint256 amount = s_botExecutionRewards[msg.sender];
+        s_botExecutionRewards[msg.sender] = 0;
+
+        bool success = IERC20(s_tokenCollateralAddress).transferFrom(address(this), msg.sender, amount);
+        if (!success) {
+            revert OrderBook__TransferFailed();
+        }
+        emit BotRewardsClaimed(msg.sender, amount);
     }
 
     /// @notice Immediately opens a trading position based on the current market price for an trading pair
@@ -394,7 +414,7 @@ contract OrderBook is ReentrancyGuard, Ownable {
         //---------------------------------------------
 
         //checking PNL and paying out winnings or losses. If PNL is less than zero the user loses their collateral
-        if (userPNL >= 0) {
+        if (userPNL > 0) {
             uint256 uintUserPNL = uint256(userPNL);
             _sendFunds(msg.sender, uintUserPNL);
         }
@@ -742,6 +762,39 @@ contract OrderBook is ReentrancyGuard, Ownable {
         return s_userOpenTrades[user][pairIndex];
     }
 
+    //Nice job mate!!👍🏻🤩
+    // leave this function with some  padding if you plan to add more trading pairs.
+    function getAllUserOpenTrades(address user) external view returns (PositionDetails[15] memory) {
+        PositionDetails[15] memory allOpenPositions;
+        // 5 is the number of available assets
+        // previously the number of assets was read from storage (may have been due to another reason, it could work now, but there is not a reason to read from storage), but we were getting errors
+        for (uint256 i = 0; i < 5; i++) {
+            // 3 is the max number of trades user's can have for a pair
+            for (uint256 index = 0; index < 3; index++) {
+                if (s_userTradeDetails[user][i][index].leverage != 0) {
+                    uint256 arrayLocation = i * 3 + index;
+                    allOpenPositions[arrayLocation] = (s_userTradeDetails[user][i][index]);
+                } else {}
+            }
+        }
+        return allOpenPositions;
+    }
+
+    function getTradePositionBorrowFees(address user, uint256 assetPairIndex, uint256 openTradesIdForPair)
+        external
+        view
+        returns (int256 borrowFeeAmount)
+    {
+        PositionDetails memory positionDetails = s_userTradeDetails[user][assetPairIndex][openTradesIdForPair];
+
+        int256 borrowFeePercentage =
+            _calculateBorrowFee(user, assetPairIndex, positionDetails.longShort, openTradesIdForPair);
+
+        borrowFeeAmount = borrowFeePercentage * int256(block.timestamp - positionDetails.openTime)
+            * int256(positionDetails.collateralAfterFee * positionDetails.leverage)
+            / (LEVERAGE_PRECISION * FEE_PRECISION * SECONDS_IN_HOUR);
+    }
+
     function getUserLiquidationPrice(address user, uint256 assetPairIndex, uint256 openTradesIdForPair)
         external
         view
@@ -805,5 +858,9 @@ contract OrderBook is ReentrancyGuard, Ownable {
         uint256 arrayLength = assetPairDetails.borrowFee.length;
         int256 curentBorrowFee = assetPairDetails.borrowFee[arrayLength - 1];
         return curentBorrowFee;
+    }
+
+    function getBaseBorrowFee() external view returns (int256 baseBorrowFee) {
+        baseBorrowFee = s_baseBorrowFeePercentage;
     }
 }
