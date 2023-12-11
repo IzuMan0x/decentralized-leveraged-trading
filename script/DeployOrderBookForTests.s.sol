@@ -6,8 +6,6 @@ import {Script} from "forge-std/Script.sol";
 import {HelperConfig} from "./HelperConfig.s.sol";
 import {OrderBook} from "../src/OrderBook.sol";
 
-😜
-
 contract DeployOrderBookForTests is Script {
     OrderBook public orderBook;
 

@@ -30,7 +30,7 @@ System requirements:
 ## Running tests
 
 1. Open a terminal in the root directory and run `forge test` (least info) or `forge test -vvvv` (most info) which will run all the tests.
-2. To run a specific test use the following command `forge test --match-test replaceThisWIthTestName -vvv  `
+2. To run a specific test use the following command `forge test --match-test replaceThisWithTestName -vvv  `
    1. The v's at the end represent the amount of information displayed in the terminal with nothing bein being the least and -vvvv being the most information.
 
 ## How to deploy MyUsdc

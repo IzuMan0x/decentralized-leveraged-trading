@@ -122,7 +122,7 @@ contract OrderBook is ReentrancyGuard, Ownable {
     int256 private s_baseVariableBorrowFeePercentage = 100;
     int256 private s_maxBorrowInterestRate = 100 * 100;
     int256 private s_minTradeSize = 1500 ether;
-    uint256 private s_limitOrderMaxSlippage = 5;
+    int256 private s_limitOrderMaxSlippage = 5;
     int256 private s_botRewardsBase = 2 ether;
     int256 private s_botRewardsRate = 0;
 
@@ -183,7 +183,7 @@ contract OrderBook is ReentrancyGuard, Ownable {
     event UserPNL(int256 indexed userPNl);
     //LimitOrder
     event LimitOrderPlaced(address indexed userAddress, uint256 indexed pairIndex, uint256 indexed tradeSlot);
-    event LimitOrderMaxSLippageChanged(uint256 indexed newLimitOrderMaxSlippage);
+    event LimitOrderMaxSLippageChanged(int256 indexed newLimitOrderMaxSlippage);
     event LimitOrderExecuted(address indexed executor, address indexed trader, uint256 indexed pairIndex);
     event LimitOrderCanceled(address indexed userAddress, uint256 indexed pairIndex);
 
@@ -362,7 +362,7 @@ contract OrderBook is ReentrancyGuard, Ownable {
         emit MaxOpenInterestChanged(pairIndex, s_assetPairDetails[pairIndex].maxOpenInterest);
     }
 
-    function setLimitOrderMaxSlippage(uint256 newSlippageLimit) external onlyOwner {
+    function setLimitOrderMaxSlippage(int256 newSlippageLimit) external onlyOwner {
         s_limitOrderMaxSlippage = newSlippageLimit;
         emit LimitOrderMaxSLippageChanged(s_limitOrderMaxSlippage);
     }
@@ -484,13 +484,13 @@ contract OrderBook is ReentrancyGuard, Ownable {
             * (s_userTradeDetails[userAddress][pairIndex][openTradeSlot].openPrice - targetPrice)
             / ((s_userTradeDetails[userAddress][pairIndex][openTradeSlot].openPrice + targetPrice) / 2);
 
-        //This will allow a max price slippage of 5 percent
+        //Currently the slippage is set to 5%
         if (orderType == 0) {
-            if (percentDifference > 10) {
+            if (percentDifference > s_limitOrderMaxSlippage) {
                 revert OrderBook__LimitOrderExecutionFailedTooMuchSlippage();
             }
         } else {
-            if (percentDifference < -5) {
+            if (percentDifference < -1 * s_limitOrderMaxSlippage) {
                 revert OrderBook__LimitOrderExecutionFailedTooMuchSlippage();
             }
         }
